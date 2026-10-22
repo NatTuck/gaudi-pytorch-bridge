@@ -88,8 +88,15 @@ function(set_up_link_options target_name)
   target_link_options(${target_name} PRIVATE -Wl,-z,noexecstack)
   # Enable Read-Only Relocation as required by SDL
   target_link_options(${target_name} PRIVATE -Wl,-z,relro)
-  # Enable Position Independent Execution as required by SDL
-  target_link_options(${target_name} PRIVATE -pie)
+  # Enable Position Independent Execution as required by SDL.
+  # -pie is an EXECUTABLE link option. Applied to a SHARED library it makes ld produce a PIE
+  # executable: it pulls in Scrt1.o, demands `main`, and forces full symbol resolution -- so
+  # every symbol this library legitimately leaves for its plugin to resolve at load time
+  # becomes a hard link error. Guard on the target type; a .so is already position independent.
+  get_target_property(_hpu_target_type ${target_name} TYPE)
+  if(NOT _hpu_target_type MATCHES "LIBRARY")
+    target_link_options(${target_name} PRIVATE -pie)
+  endif()
 endfunction()
 
 function(enforce_hardening target_name)

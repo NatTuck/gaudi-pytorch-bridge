@@ -791,7 +791,23 @@ void GraphExec::PrepareOptimizedGraphForLaunch(
 torch::jit::Stack GraphExec::launch(
     torch::jit::Stack& stack,
     std::vector<at::Tensor>& outputs) {
-  PT_EAGER_TRACE_WITH_NAME(m_graph_name);
+  // Emit the SYNAPSE graph name rather than the JIT one. The post-graph dump's `graph_name` is
+  // exactly this string -- the same jit->syn substitution GetSynapseGraphName applies
+  // (backend/kernel/hpu_habana_launch_op_pt.cpp) -- plus a compile-time suffix. Emitting it here
+  // puts a recipe identity on an event that is on the Python thread and inside the
+  // `Torch-Compiled Region` span, which is what makes a device event attributable to code
+  // without pairing the host streams by position.
+  // PTFuncLog stores std::string_view, so this must outlive the logger; a temporary passed
+  // straight into the macro would dangle for the whole function scope.
+  const std::string syn_graph_name = [this]() {
+    std::string name = m_graph_name;
+    const auto pos = name.find("_jit");
+    if (pos != std::string::npos) {
+      name.replace(name.find("jit"), 3, "syn");
+    }
+    return name;
+  }();
+  PT_EAGER_TRACE_WITH_NAME(syn_graph_name);
 
   torch::jit::Stack backend_inputs =
       habana::eager::convert_ivalues_to_backend_tensors(stack);

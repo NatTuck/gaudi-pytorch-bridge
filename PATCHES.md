@@ -10,8 +10,9 @@ event to a source line, which of them are keys and which are inferences, and wha
 
 | item | state |
 |---|---|
+| 0. `-pie` on shared libraries (build fix) | **applied, verified** — without it the backend does not link |
 | 1. `export_chrome_trace` signature | **applied, verified** |
-| 2. recipe identity in the trace | **identified, NOT applied** — needs a build to verify |
+| 2. recipe identity in the trace | **applied, verified end to end** |
 
 ---
 
@@ -111,23 +112,29 @@ const std::string syn_graph_name = [] (std::string n) {
 PT_EAGER_TRACE_WITH_NAME(syn_graph_name);
 ```
 
-### Why it is not applied here
+### Verified end to end
 
-It needs a build to verify, and **the bridge does not link in this environment**. A clean
-`cmake -G Ninja` configure succeeds, 780 of 1,102 targets compile, and the link of
-`libhabana_pytorch_backend.so` fails with undefined references to `Logger::habana_assert`,
-`hl_logger::v12_inline_fmt_compile::…::levels` and
-`lazy_to_backend::is_lazy_inference_call_context()`.
+Applied and measured on a Gaudi 2 (torch 2.13.0a0+git2469d18, SynapseAI 1.24.2.481). A three-block
+program — one block per engine, each its own `torch.compile` region — now attributes as a key join:
 
-That is a build-configuration problem, not a patch problem, and it has been seen here before: the
-earlier successful build used **cmake 3.31.6**, and CMake 4.x changed link-ordering behaviour.
-Only cmake 4.4.x is installed now. The environment needed is otherwise recorded and reproducible —
-the required env vars (`HABANA_SOFTWARE_STACK`, `HCL_INCLUDE_DIR`, `SPECS_EXT_ROOT`,
-`SPECS_EMBEDDED_ROOT`, `SYNAPSE_INCLUDE_DIR`, `SYNAPSE_UTILS_INCLUDE_DIR`, `SWTOOLS_SDK_ROOT`,
-`BUILD_ROOT_LATEST`, `PYTORCH_MODULES_ROOT_PATH`) plus `latest/libhl_logger.so` symlinked from
-`/usr/lib/habanalabs/`.
+```
+=== region -> recipe: KEY JOIN via graph name (patched bridge)
+recipe_chain_demo.py:63:mme_block  MME 0.038 ms   recipe 57369  dump graph_0000_fused_0_syn_1000000_1000000_4.5.57369
+recipe_chain_demo.py:76:dma_block  DMA 0.016 ms   recipe 61189  dump graph_0002_fused_0_syn_1002000_1002000_6.5.61189
+recipe_chain_demo.py:68:tpc_block  TPC 0.014 ms   recipe 62418  dump graph_0001_fused_0_syn_1001000_1001000_5.5.62418
+verification: PASS -- engine attribution matches the code's intent
+```
 
-**Nothing is claimed about behaviour until that build runs.** The derivation above is a source read.
+Three compile ids resolve to three source lines, three recipes, three dumps, and the node types
+confirm the intent (`GEMM x2` for the matmul block, one fused TPC kernel for the elementwise block,
+`DmaMemcpy + add_fwd_bf16` for the copy block). Every `_syn_` event name mapped to **exactly one**
+dump.
+
+Note the join is a **prefix** match, not equality: the event carries
+`graph_0000_fused_0_syn_1000000` while the dump is `…_syn_1000000_1000000_4`, because
+`get_unique_recipe_name` appends a compile-time suffix. The dumper names each file after the graph,
+so matching the event name against the *filename* is unambiguous in practice — but a consumer should
+treat it as a prefix and assert uniqueness, as the reference implementation does.
 
 ---
 
@@ -135,3 +142,56 @@ the required env vars (`HABANA_SOFTWARE_STACK`, `HCL_INCLUDE_DIR`, `SPECS_EXT_RO
 
 Unchanged from stock, except that cmake 3.31.6 is currently required (see above). The build must use
 the same torch as the runtime — here `2.13.0a0+git2469d18`.
+
+---
+
+## 0. `-pie` is applied to shared libraries, so the backend cannot link — APPLIED, VERIFIED
+
+`cmake/Targets.cmake`, in `set_up_link_options()`:
+
+```cmake
+target_link_options(${target_name} PRIVATE -pie)   # applied to every target, SHARED included
+```
+
+`-pie` is an **executable** link option. On a `-shared` link it makes `ld` produce a PIE executable:
+it pulls in `Scrt1.o`, demands `main`, and forces full symbol resolution. Every symbol the backend
+legitimately leaves for the plugin to resolve at load time then becomes a hard error:
+
+```
+/usr/bin/ld: Scrt1.o: in function `_start': undefined reference to `main'
+/usr/bin/ld: … undefined reference to `Logger::habana_assert(…)'
+/usr/bin/ld: … undefined reference to `lazy_to_backend::is_lazy_inference_call_context()'
+```
+
+Those references are **correct**: the shipped working `libhabana_pytorch_backend.so` leaves both
+undefined (`nm -D --undefined-only` → 1 each), because `habana_pytorch_plugin_common` is an OBJECT
+library the *plugin* links, not the backend.
+
+The guard below fixes it; the flag ordering makes an override ineffective (`-no-pie` placed before
+the target's `-pie` loses — verified, the link still failed).
+
+```cmake
+get_target_property(_hpu_target_type ${target_name} TYPE)
+if(NOT _hpu_target_type MATCHES "LIBRARY")
+  target_link_options(${target_name} PRIVATE -pie)
+endif()
+```
+
+This is a genuine upstream defect rather than a workaround: the build currently depends on flag
+ordering to avoid linking a shared library as an executable. Worth reporting separately from #23,
+which is about the profiler.
+
+## Build environment
+
+Nine environment variables are required (`HABANA_SOFTWARE_STACK`, `HCL_INCLUDE_DIR`,
+`SPECS_EXT_ROOT`, **`SPECS_EMBEDDED_ROOT`**, `SYNAPSE_INCLUDE_DIR`, `SYNAPSE_UTILS_INCLUDE_DIR`,
+`SWTOOLS_SDK_ROOT`, `BUILD_ROOT_LATEST`, `PYTORCH_MODULES_ROOT_PATH`), plus
+`latest/libhl_logger.so` symlinked from `/usr/lib/habanalabs/`.
+
+`SPECS_EMBEDDED_ROOT` is **not** in the project's `REQUIRED_ENV_VARIABLES` list, so omitting it is
+silent — and without it `cmake/PrepareDependencies.cmake` never creates `npu::specs_embedded`,
+`mem_hlml.cpp` is dropped, and the resulting library is not a drop-in (it lacks the `HlMlMemory*`
+symbols the installed `_hpu_C.so` needs, so `import torch` fails).
+
+Built and verified with **cmake 4.4.x** — the earlier belief that an older cmake was required was
+wrong; the `-pie` flag was the cause.

@@ -529,7 +529,14 @@ void HpuActivityProfilerSession::start() {
         "launch_recipe",
         "launch",
         "run",
-        "Launch"};
+        "Launch",
+        // The per-graph annotation emitted by GraphExec::launch and
+        // GraphExecsGroup::launch. Its NAME IS THE SYNAPSE GRAPH NAME, which is the prefix of
+        // the post-graph dump's `graph_name` -- so letting it through is what makes a device
+        // event attributable to a recipe, and therefore to a source line, without pairing the
+        // host streams by position. The filter below is a regex_search, so this matches the
+        // whole family of graph names.
+        "^graph_"};
   }
 
   bool bridge_profile = Config::getInstance().isBridgeProfileEnabled();
