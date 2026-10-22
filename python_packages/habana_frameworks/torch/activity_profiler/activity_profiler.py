@@ -60,8 +60,11 @@ def register_habana_activity_profiler():
     original_activity = torch.profiler.ProfilerActivity
 
     class habana_autograd_profile_wrapper(torch.autograd.profiler.profile):
-        def export_chrome_trace(self, path):
-            super().export_chrome_trace(path)
+        def export_chrome_trace(self, path, *args, **kwargs):
+            # torch >= 2.13 calls export_chrome_trace(path, metadata); the previous
+            # signature took (self, path) only and raised TypeError at profiler exit,
+            # after the profiling window had already completed.
+            super().export_chrome_trace(path, *args, **kwargs)
             # W/A for issue https://github.com/pytorch/pytorch/issues/146900
             # Should be removed once the issue is fixed.
             if getattr(self, "with_stack", False):
@@ -192,8 +195,11 @@ def register_habana_light_activity_profiler():
             return getattr(self._real, name)
 
     class habana_autograd_profile_wrapper(torch.autograd.profiler.profile):
-        def export_chrome_trace(self, path):
-            super().export_chrome_trace(path)
+        def export_chrome_trace(self, path, *args, **kwargs):
+            # torch >= 2.13 calls export_chrome_trace(path, metadata); the previous
+            # signature took (self, path) only and raised TypeError at profiler exit,
+            # after the profiling window had already completed.
+            super().export_chrome_trace(path, *args, **kwargs)
             # W/A for issue https://github.com/pytorch/pytorch/issues/146900
             # Should be removed once the issue is fixed.
             if getattr(self, "with_stack", False):
