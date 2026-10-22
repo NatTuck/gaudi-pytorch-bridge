@@ -1,25 +1,32 @@
 # This branch: profiling identity for Gaudi 2
 
-A small, deliberately narrow patch set against upstream `v1.24.2`. It exists because the
-profiling trace on this stack **cannot be joined to the code that produced it**, which is the
-difference between a timing instrument and a diagnostic one.
+A small, deliberately narrow patch set against upstream `v1.24.2`. It exists because the profiling
+trace on this stack **cannot be joined to the code that produced it**, which is the difference
+between a timing instrument and a diagnostic one.
 
-Everything here is written up in a Gaudi 2 optimization manual chapter on the identity chain
+The reasoning is written up in a Gaudi 2 optimization manual chapter on the identity chain
 (`g2-opt-manual/05-profiling.md` in the project this came out of): the five joins from a device
 event to a source line, which of them are keys and which are inferences, and what breaks.
 
+| item | state |
+|---|---|
+| 1. `export_chrome_trace` signature | **applied, verified** |
+| 2. recipe identity in the trace | **identified, NOT applied** — needs a build to verify |
+
+---
+
 ## 1. `export_chrome_trace` rejects torch 2.13's call signature — APPLIED, VERIFIED
 
-`python_packages/habana_frameworks/torch/activity_profiler/activity_profiler.py`, both
-occurrences (`habana_profile_wrapper` and `habana_autograd_profile_wrapper`):
+`python_packages/habana_frameworks/torch/activity_profiler/activity_profiler.py`, both occurrences
+(`habana_profile_wrapper` and `habana_autograd_profile_wrapper`):
 
 ```python
 def export_chrome_trace(self, path, *args, **kwargs):
     super().export_chrome_trace(path, *args, **kwargs)
 ```
 
-torch 2.13 calls `export_chrome_trace(path, metadata)`. The unpatched shim takes `(self, path)`,
-so **any** use of `torch.profiler.tensorboard_trace_handler` raises at profiler exit:
+torch 2.13 calls `export_chrome_trace(path, metadata)`. The unpatched shim takes `(self, path)`, so
+**any** use of `torch.profiler.tensorboard_trace_handler` raises at profiler exit:
 
 ```
 TypeError: ...habana_autograd_profile_wrapper.export_chrome_trace() takes 2 positional arguments but 3 were given
@@ -31,10 +38,9 @@ It fires *after* the window has completed, so the run is lost. Filed upstream as
 **Verified** by monkeypatching the method to accept the extra argument and calling the torch-level
 export: 790 events, 5 `Torch-Compiled Region` spans, 494 device events. Previously: `TypeError`.
 
-## 2. The recipe identity the profiler needs is emitted but filtered out — NOT APPLIED
+---
 
-This is the interesting one, and it is **not** in this branch yet, because the correct string is
-not yet identified. Recording the state so nobody repeats the search.
+## 2. The recipe identity is emitted but filtered out — IDENTIFIED, NOT APPLIED
 
 ### The problem
 
@@ -50,57 +56,82 @@ halves, on different events, with no shared field:
 Pairing the two host streams by position works only when they are 1:1 — exact on a small program
 (20/20/20), unusable on a real model (1576 launches vs 1604 enqueues, 24.6 % modal share, 0 of 118
 compile ids consistent). Constant-lag alignment fails too (25 % at every offset from −40 to +40).
-Torch's `External id` correlation does not reach HPU device events (0 of 3,880 carry it).
+Torch's `External id` correlation never reaches HPU device events (0 of 3,880 carry it).
 
-### What the source says
+### What the source says — the missing link is one string substitution
 
-The bridge **already** emits the annotation we need, on the Python thread, inside the region span:
+The bridge **already** emits an annotation carrying the FX graph name, on the Python thread, inside
+the region span:
 
-- `habana_eager/graph_execs_group.cpp:123` — `PT_EAGER_TRACE_WITH_NAME(m_graphs_group_name)`
-- `habana_eager/graph_exec.cpp:208` and `:794` — `PT_EAGER_TRACE_WITH_NAME(m_graph_name)`
+- `habana_eager/graph_exec.cpp:794` — `PT_EAGER_TRACE_WITH_NAME(m_graph_name)` in `GraphExec::launch`
 
-They never reach the trace because `HpuActivityProfilerSession::start()`
+It never reaches the trace because `HpuActivityProfilerSession::start()`
 (`backend/profiling/kineto_activity_profiler.cpp:517`) passes a `mandatory_events` list, and
-`BridgeLogsSourceImpl` drops any event whose name does not match one of those patterns. The list
-contains `launch_recipe`, `LaunchRecipeTask`, `add_new_recipe`, `launch`, `run`, `Launch` — none of
-which match a graph name.
+`BridgeLogsSourceImpl` drops every event whose name matches none of those patterns. The list holds
+`launch_recipe`, `LaunchRecipeTask`, `add_new_recipe`, `launch`, `run`, `Launch` — a graph name
+matches none of them. The filter is `std::regex_search`
+(`backend/profiling/trace_sources/bridge_logs_source.cpp:110-113`), so **a longer name still
+passes**: appending one pattern is enough to let the annotation through.
 
-The filter is `std::regex_search` (`backend/profiling/trace_sources/bridge_logs_source.cpp:110-113`),
-so **a longer name still passes**: appending a pattern to that list is enough to let the annotation
-through. No new plumbing is needed, and `addActivity` already supports an args map if we later want
-the id as a field rather than in the name.
+And the name in the dump is derived from that same FX name by one substitution. In
+`backend/kernel/hpu_habana_launch_op_pt.cpp:247-248`:
 
-### Why the patch is not here yet
+```cpp
+if (syn_graph_name_.find("_jit") != std::string::npos) {
+  syn_graph_name_.replace(syn_graph_name_.find("jit"), 3, "syn");
+}
+```
 
-Two candidate strings, and **both are wrong**:
+`GetSynapseGraphName()` is that result, and the recipe name handed to `synGraphCompile` is
+`get_unique_recipe_name(name_, eager_mode)` = `graph_dump_dir + name_ + "_" + suffix`
+(`backend/synapse_helpers/graph.cpp:643`). That is exactly the `graph_name` in the post-graph dump.
 
-- `m_graphs_group_name` is `"graphs_group_" + std::to_string(recipe_id)` (`graph_execs_group.cpp:112`)
-  — a GraphStorage index, not the dump's `graph_name`.
-- `m_graph_name` is the *FX* name (`graph_execs_group.h:64` → `graph_exec.cpp:367`, with an
-  `_fx`→`_jit` rewrite at `:379-380`), not the Synapse recipe name.
+**So: `dump.graph_name` == `<dump_dir>/` + `m_graph_name` with `jit`→`syn` + `_<suffix>`.**
 
-The name that appears in the dump is generated at compile time:
-`get_unique_recipe_name(name_, eager_mode)` (`backend/synapse_helpers/graph.cpp:643`) =
-`graph_dump_dir + name_ + "_" + suffix`, and that string is what is handed to `synGraphCompile`.
+Two earlier candidates were checked and are **wrong** — recording them so the search is not
+repeated: `m_graphs_group_name` is `"graphs_group_" + recipe_id` (`graph_execs_group.cpp:112`), a
+GraphStorage index; `m_parent_graph_name` is the pre-substitution FX name.
 
-**So the next step is an instrumented build**: print `m_graphs_group_name`, `m_graph_name`,
-`recipe_id`, and the compiled recipe name at launch, run a small program, and diff against
-`<dump>/.graph_dumps/*.json`. Whichever string reproduces the dump's `graph_name` is the one to
-annotate — and if it is only a prefix, the suffix must come from the compile site, which moves the
-patch to `GraphExec`/`GraphExecsGroup` where the compiled recipe lives.
+### The patch that follows
 
-Note for whoever does it: `PTFuncLog` stores `std::string_view` (`pytorch_helpers/habana_helpers/logging.h:519-523`),
-so a dynamic name must be a named `std::string` that outlives the logger — a temporary passed
-straight into the macro dangles for the whole function scope.
+1. `backend/profiling/kineto_activity_profiler.cpp` — add a pattern for the graph-name family to the
+   eager `mandatory_events` list (e.g. `^graph_`; it is a regex, and the names are
+   `graph_<NNNN>_fused_…`).
+2. `habana_eager/graph_exec.cpp:794` — emit the *synapse-form* name, so the event name is directly
+   the dump prefix:
+
+```cpp
+// PTFuncLog stores std::string_view (pytorch_helpers/habana_helpers/logging.h:519-523),
+// so this must outlive the logger -- a temporary passed into the macro would dangle.
+const std::string syn_graph_name = [] (std::string n) {
+  const auto pos = n.find("_jit");
+  if (pos != std::string::npos) n.replace(n.find("jit"), 3, "syn");
+  return n;
+}(m_graph_name);
+PT_EAGER_TRACE_WITH_NAME(syn_graph_name);
+```
+
+### Why it is not applied here
+
+It needs a build to verify, and **the bridge does not link in this environment**. A clean
+`cmake -G Ninja` configure succeeds, 780 of 1,102 targets compile, and the link of
+`libhabana_pytorch_backend.so` fails with undefined references to `Logger::habana_assert`,
+`hl_logger::v12_inline_fmt_compile::…::levels` and
+`lazy_to_backend::is_lazy_inference_call_context()`.
+
+That is a build-configuration problem, not a patch problem, and it has been seen here before: the
+earlier successful build used **cmake 3.31.6**, and CMake 4.x changed link-ordering behaviour.
+Only cmake 4.4.x is installed now. The environment needed is otherwise recorded and reproducible —
+the required env vars (`HABANA_SOFTWARE_STACK`, `HCL_INCLUDE_DIR`, `SPECS_EXT_ROOT`,
+`SPECS_EMBEDDED_ROOT`, `SYNAPSE_INCLUDE_DIR`, `SYNAPSE_UTILS_INCLUDE_DIR`, `SWTOOLS_SDK_ROOT`,
+`BUILD_ROOT_LATEST`, `PYTORCH_MODULES_ROOT_PATH`) plus `latest/libhl_logger.so` symlinked from
+`/usr/lib/habanalabs/`.
+
+**Nothing is claimed about behaviour until that build runs.** The derivation above is a source read.
+
+---
 
 ## Building
 
-The patch set is intended to be built the same way the stock bridge is; nothing here changes the
-build. `cmake -G Ninja` against the same torch the runtime uses (here `2.13.0a0+git2469d18`).
-
-## Status
-
-| item | state |
-|---|---|
-| 1. `export_chrome_trace` signature | applied, verified, safe to carry |
-| 2. recipe identity in the trace | **not applied** — correct string under investigation |
+Unchanged from stock, except that cmake 3.31.6 is currently required (see above). The build must use
+the same torch as the runtime — here `2.13.0a0+git2469d18`.
