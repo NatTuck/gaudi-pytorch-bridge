@@ -28,6 +28,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental.proxy_tensor import py_sym_types, unset_fake_temporarily
 
+from . import launch_ledger
 from .random_utils import is_random_op
 from .symbolic_execution import (
     PythonPrinter,
@@ -185,6 +186,7 @@ class HabanaGraphModule(torch.nn.Module):
         force_static_compile=False,
         has_random_ops=False,
         is_reusables: list[bool] | None = None,
+        ledger_handle=None,
     ):
         from ._recipe_compiler_C import EmptyBatchData
 
@@ -203,6 +205,10 @@ class HabanaGraphModule(torch.nn.Module):
         self._range_list = []
         self._inference = not is_training
         self._recipe_id = None
+        # Compile-time half of the launch ledger: which region this recipe
+        # belongs to, so that a launch record (which knows only a recipe) can be
+        # joined back to (region name, index). None when the ledger is off.
+        self._ledger_handle = ledger_handle
         self._dynamic = dynamic
         self._has_dynamic_marked_tensors = False
         self._force_static_compile = force_static_compile
@@ -335,6 +341,11 @@ class HabanaGraphModule(torch.nn.Module):
 
             dump_fx_graph(self._fx_module, self._jit_ir, self._recipe_id)
 
+            # The recipe id exists only now, and only now can the side table be
+            # written: (recipe_id -> region name, `foo.N`). One write per
+            # compiled recipe, at compile time, off the launch path.
+            launch_ledger.note_recipe(self._recipe_id, self._ledger_handle)
+
         elif self._has_randoms:
             inputs = (None, None) + inputs
 
@@ -398,6 +409,9 @@ def get_callable_recipe(
             force_static_compile=hpu_backend_config.force_static_compile,
             has_random_ops=has_random_ops,
             is_reusables=is_reusables,
+            # Stored, not numbered: the frame's partitions are all known only
+            # after the partitioner has finished with the frame.
+            ledger_handle=launch_ledger.record_partition(parent_graph_name, graph_module),
         )
     else:
         # Return unchanged module, it will be ran eagerly.

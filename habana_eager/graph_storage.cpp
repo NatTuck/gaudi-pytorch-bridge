@@ -72,6 +72,10 @@ size_t GraphStorage::add_precompiled_recipe(
   PT_EAGER_TRACE;
   size_t recipe_group_id{m_storage_vec.size()};
   auto region = PrecompiledRegion::load(dir, key);
+  // A precompiled region's recipe was deserialized, not compiled, so it has no
+  // ledger key of its own: give it one from the artifact key before it can be
+  // launched, so its launches are attributable rather than counted as eager.
+  region->set_ledger_identity(key);
   m_storage_vec.emplace_back(std::in_place_type<PrecompiledRegion>, std::move(*region));
   PT_EAGER_DEBUG(
       "Precompiled region added to storage. recipe_group_id: ",

@@ -11,6 +11,10 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Modified here. The original licence above is Apache-2.0; the changes in this
+ * file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+ * recorded rather than hidden, as AGENTS.md requires.
  */
 #pragma once
 
@@ -142,6 +146,11 @@ class graph {
     std::string recipe_name_{""};
     bool graph_is_empty_{false};
     bool in_execution_phase_{false};
+    // Identity of this recipe for the launch ledger: FNV-1a of recipe_name_,
+    // minted once in graph::compile() so the launch path never hashes a string.
+    // 0 means "not set", which is what a handle that never went through
+    // graph::compile() (a region loaded from a persisted artifact) carries.
+    uint64_t ledger_key_{0};
     uint64_t get_recipe_host_mem_size();
 
     explicit recipe_handle() {};

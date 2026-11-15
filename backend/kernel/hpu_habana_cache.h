@@ -32,6 +32,7 @@
 #include "backend/kernel/hpu_shape_inference.h"
 #include "backend/profiling/trace_sources/bridge_logs_source.h"
 #include "backend/synapse_helpers/graph.h"
+#include "backend/synapse_helpers/launch_ledger.h"
 #include "habana_helpers/logging.h"
 #include "synapse_common_types.h"
 
@@ -634,6 +635,21 @@ struct PrecompiledRegion {
   }
   const RecipeLauncher& rl() const {
     return *holder_->rl_;
+  }
+
+  // Identity for the launch ledger. A region loaded from a persisted artifact
+  // never went through graph::compile(), so its recipe_handle carries no
+  // ledger key; the artifact key is the identity it does have, and it is the
+  // same string on every boot, which is what makes a precompiled launch
+  // joinable across boots as well as within one.
+  void set_ledger_identity(const std::string& key) {
+    if (holder_ && holder_->rl_ && holder_->rl_->recipe_) {
+      auto& handle = *holder_->rl_->recipe_;
+      if (handle.recipe_name_.empty()) {
+        handle.recipe_name_ = "precompiled:" + key;
+      }
+      handle.ledger_key_ = habana::ledger::fnv1a(handle.recipe_name_);
+    }
   }
 };
 

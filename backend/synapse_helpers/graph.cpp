@@ -11,6 +11,10 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Modified here. The original licence above is Apache-2.0; the changes in this
+ * file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+ * recorded rather than hidden, as AGENTS.md requires.
  */
 #include <absl/strings/str_format.h>
 #include <absl/strings/str_join.h>
@@ -34,6 +38,7 @@
 #include "backend/synapse_helpers/graph.h"
 #include "backend/synapse_helpers/stream.h"
 #include "backend/synapse_helpers/tensor_builder_base.h"
+#include "backend/synapse_helpers/launch_ledger.h"
 #include "habana_helpers/logging.h"
 #include "habana_helpers/stat_collection.h"
 #include "habana_helpers/towl.h"
@@ -677,6 +682,12 @@ std::shared_ptr<graph::recipe_handle> graph::compile() {
   recipe_handle->graph_is_empty_ = graph_is_empty_;
   recipe_handle->in_execution_phase_ = true;
   recipe_handle->recipe_name_ = std::move(name);
+  // Mint the launch-ledger key once, here, so that the launch path stores a
+  // uint64 instead of hashing a string per launch. `eager_mode_` is the flag
+  // that decides whether this recipe is an eager op's recipe or a compiled
+  // region's, and it is the flag that lets the report tell them apart.
+  recipe_handle->ledger_key_ = habana::ledger::note_compile(
+      recipe_handle->recipe_name_, name_, eager_mode_);
 
   auto syn_compile_duration_us =
       std::chrono::duration_cast<std::chrono::duration<int64_t, std::micro>>(
@@ -776,6 +787,12 @@ void graph::launch(
 
   HABANA_ASSERT(
       recipe_handle.in_execution_phase_, "Graph not in execution phase.");
+
+  // One record per launch, at the only function every launch passes through:
+  // the compiled-region path via RecipeLauncher::Launch and the eager path via
+  // synapse_helpers::recipe::launch. When the ledger is off this is a load of a
+  // static bool and a not-taken branch.
+  habana::ledger::record_launch(recipe_handle.ledger_key_);
 
   // Optimize tensor size patching - single pass
   for (synLaunchTensorInfo& tensorInfo : inputs_and_outputs_info) {

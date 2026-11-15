@@ -34,6 +34,7 @@
 #include "backend/kernel/hpu_habana_meta_op_list.h"
 #include "backend/profiling/trace_sources/bridge_logs_source.h"
 #include "backend/synapse_helpers/devmem_logger.h"
+#include "backend/synapse_helpers/launch_ledger.h"
 #include "common/utils.h"
 #include "common/warning_suppress.h"
 #include "habana_helpers/logging.h"
@@ -1614,6 +1615,13 @@ RecipeLauncher::RecipeLauncher(
     deserialize(is, recipe_->graph_is_empty_);
     recipe_->syn_recipe_handle_ = recipe;
     recipe_->in_execution_phase_ = true;
+    // A recipe that came back from the disk cache was never compiled in this
+    // process, so graph::compile() never ran for it and it has no ledger key.
+    // The name is serialized with the recipe, so the key can be minted here
+    // exactly as the compile path mints it. Without this, a warm boot would
+    // report every launch as unattributed -- which is the boot we actually run.
+    recipe_->ledger_key_ = habana::ledger::note_compile(
+        recipe_->recipe_name_, graph_name_, false);
   }
   deserialize(is, workspace_size_);
   deserialize(is, ntensorbytes_);
