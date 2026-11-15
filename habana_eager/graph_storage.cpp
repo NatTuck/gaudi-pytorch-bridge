@@ -11,6 +11,10 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Modified here. The original licence above is Apache-2.0; the changes in this
+ * file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+ * recorded rather than hidden, as AGENTS.md requires.
  */
 #include <string>
 
@@ -42,6 +46,7 @@ size_t GraphStorage::add_new_recipe(
   PT_EAGER_TRACE;
   size_t output_recipe_group_id{m_storage_vec.size()};
   m_storage_vec.emplace_back(
+      std::in_place_type<GraphExecsGroup>,
       output_recipe_group_id,
       graph,
       parent_graph_name,
@@ -61,12 +66,31 @@ size_t GraphStorage::add_new_recipe(
   return output_recipe_group_id;
 }
 
+size_t GraphStorage::add_precompiled_recipe(
+    const std::string& dir,
+    const std::string& key) {
+  PT_EAGER_TRACE;
+  size_t recipe_group_id{m_storage_vec.size()};
+  auto region = PrecompiledRegion::load(dir, key);
+  m_storage_vec.emplace_back(std::in_place_type<PrecompiledRegion>, std::move(*region));
+  PT_EAGER_DEBUG(
+      "Precompiled region added to storage. recipe_group_id: ",
+      recipe_group_id,
+      " key: ",
+      key);
+  return recipe_group_id;
+}
+
 torch::jit::Stack GraphStorage::launch_recipe(
     size_t recipe_id,
     torch::jit::Stack& inputs,
     std::vector<at::Tensor>& outputs,
     std::string& parent_graph_name) {
   PT_EAGER_TRACE;
+  // The region-artifact probe's device half runs here: this is the thread that
+  // owns the stream, and it is the same choke point for every compiled region.
+  // Costs one relaxed atomic load when the probe is off or has nothing pending.
+  habana::region_probe_drain();
   auto lowering_queue_length =
       HPUDeviceContext::lowering_thread().get_active_task_count();
   // The following code ensures consistency in graph names when capturing events
@@ -87,14 +111,19 @@ torch::jit::Stack GraphStorage::launch_recipe(
       lowering_queue_length);
   PT_EAGER_DEBUG("Launching from recipe_group_id: ", recipe_id);
   HABANA_ASSERT(recipe_id < m_storage_vec.size());
-  GraphExecsGroup& gexec = m_storage_vec.at(recipe_id);
-  return gexec.launch(inputs, outputs);
+  // A compiled group and a region loaded from an artifact answer the same call.
+  return std::visit(
+      [&](auto& gexec) { return gexec.launch(inputs, outputs); },
+      m_storage_vec.at(recipe_id));
 }
 
 void GraphStorage::reset_seeds() {
   PT_EAGER_TRACE;
   for (auto& g : m_storage_vec) {
-    g.ResetSeed();
+    // A precompiled region has no seed tensors of its own to reset.
+    if (auto* group = std::get_if<GraphExecsGroup>(&g)) {
+      group->ResetSeed();
+    }
   }
 }
 

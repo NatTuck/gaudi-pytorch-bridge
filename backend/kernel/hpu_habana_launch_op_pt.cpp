@@ -12,16 +12,31 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Modified here. The original licence above is Apache-2.0; the changes in this
+ * file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+ * recorded rather than hidden, as AGENTS.md requires.
  */
 #include "backend/kernel/hpu_habana_launch_op_pt.h"
 #include <ATen/native/Resize.h>
 #include <ATen/record_function.h>
 #include <absl/functional/any_invocable.h>
 #include <algorithm>
+#include <atomic>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
+#include <vector>
 #include "backend/backend_meta.h"
 #include "backend/cache/permute_cache.h"
 #include "backend/habana_device/HPUAllocator.h"
@@ -4392,6 +4407,7 @@ void HabanaLaunchOpPT::ProcessHabanaFusedOpWithDS(
 
     if (ABSL_PREDICT_TRUE(recipe_holder)) {
       recipe_launcher_ = recipe_holder->rl_;
+      cur_rvalpsh_ = recipe_holder->rvs_;
       // Cache hit for a dynamic bucket
       // Steps:
       // 1. Infer shapes of all persistent tensors which are not input
@@ -5009,14 +5025,689 @@ void HabanaLaunchOpPT::ExecuteSynapseCache() {
     // Update the stack from the recipe itself
     UpdateRecipeOutputs();
   }
+  // Env-gated, off by default: with VLLM_HPU_REGION_ARTIFACT_PROBE unset this is
+  // one load and one branch.
+  ProbeRegionArtifact();
   PT_BRIDGE_DEBUG("Returning cached recipe : ", cur_rargpsh_->hashCode());
 
   ClearStatics();
   PT_BRIDGE_END;
 }
 
-void HabanaLaunchOpPT::DumpStaticCompilationStatistics(
-    size_t graph_key_with_perm,
+namespace {
+// ---------------------------------------------------------------------------
+// Region-artifact probe (DESIGN.md §12 stage 1).
+//
+// Settles one question: can a recipe be launched from a persisted
+// (recipe blob, metadata) pair, through this plugin's own device handle, with no
+// JIT IR graph and no HabanaLaunchOpPT const-section / permute / checksum block?
+//
+// Env-gated, default off:
+//   VLLM_HPU_REGION_ARTIFACT_PROBE=<substring|*|list>
+//       match against the region's lowered IR text and its recipe name;
+//       "list" prints one line per region and probes nothing; "*" matches all.
+//   VLLM_HPU_REGION_ARTIFACT_PROBE_NODES=<n>   require this IR node count
+//   VLLM_HPU_REGION_ARTIFACT_PROBE_AT=<k>      probe on the k-th launch (default 2)
+//   VLLM_HPU_REGION_ARTIFACT_PROBE_DIR=<dir>   artifact directory
+//
+// The probe is split in two on purpose.  Capture happens on the lowering thread,
+// where the live RecipeValueSpec / synRecipeHandle / patched inputs and outputs
+// exist; the probe itself (export, load, launch, and a synchronous device
+// read-back for the comparison) runs on the *next* region launch, from the thread
+// that owns the stream.  Measured: doing the read-back on the lowering thread
+// hangs -- the main thread is blocked waiting for that lowering task, and the
+// copy never completes.
+// ---------------------------------------------------------------------------
+struct RegionProbeState {
+  bool armed{false};
+  bool list_only{false};
+  std::string selector;
+  std::string dir;
+  size_t nodes_filter{0};
+  long at_call{2};
+  // Skip regions whose outputs are larger than this: the probe allocates a second
+  // copy of them, and doubling a prefill region's outputs is not worth the risk.
+  uintmax_t max_output_bytes{64ULL * 1024 * 1024};
+  std::mutex mtx;
+  std::unordered_map<std::string, long> counts;
+  std::unordered_map<std::string, bool> listed;
+  long probes{0};
+};
+
+// Heap-allocated because RegionProbeState holds a mutex and is therefore not
+// movable, so it cannot be returned by value from the initialiser.
+RegionProbeState& region_probe_state() {
+  static RegionProbeState* state = [] {
+    auto* s = new RegionProbeState();
+    if (const char* v = std::getenv("VLLM_HPU_REGION_ARTIFACT_PROBE");
+        v != nullptr && *v != '\0') {
+      s->armed = true;
+      s->selector = v;
+      s->list_only = (s->selector == "list");
+    }
+    if (const char* v = std::getenv("VLLM_HPU_REGION_ARTIFACT_PROBE_DIR");
+        v != nullptr && *v != '\0') {
+      s->dir = v;
+    } else {
+      s->dir = "/tmp/region-artifact-probe";
+    }
+    if (const char* v = std::getenv("VLLM_HPU_REGION_ARTIFACT_PROBE_NODES")) {
+      s->nodes_filter = std::strtoul(v, nullptr, 10);
+    }
+    if (const char* v =
+            std::getenv("VLLM_HPU_REGION_ARTIFACT_PROBE_MAX_OUTPUT_BYTES")) {
+      s->max_output_bytes = std::strtoull(v, nullptr, 10);
+    }
+    if (const char* v = std::getenv("VLLM_HPU_REGION_ARTIFACT_PROBE_AT")) {
+      s->at_call = std::strtol(v, nullptr, 10);
+      if (s->at_call < 1) {
+        s->at_call = 1;
+      }
+    }
+    return s;
+  }();
+  return *state;
+}
+
+// One captured region, waiting to be probed on the thread that owns the stream.
+struct PendingRegionProbe {
+  bool valid{false};
+  std::string identity;
+  std::string key;
+  std::string recipe_name;
+  std::string op_strs;
+  size_t ir_nodes{0};
+  size_t tensor_inputs{0};
+  size_t const_inputs{0};
+  std::shared_ptr<RecipeValueSpec> rvs;
+  std::shared_ptr<RecipeLauncher> rl;
+  std::vector<habana_torch::jit::IValue> inputs;
+  std::vector<at::Tensor> outputs;
+};
+
+// Read on every region launch (one relaxed load when the probe is off or has
+// nothing pending), so it is kept out of the mutex.  A queue, not a slot: several
+// regions can reach their capture launch before any drain happens, and a slot
+// would silently drop all but the last.
+std::atomic<bool> g_probe_pending{false};
+std::mutex g_probe_pending_mutex;
+std::deque<PendingRegionProbe> g_probe_queue;
+
+// Flushed one-line records, so they interleave sanely with the server log.
+void probe_printf(const char* fmt, ...) {
+  char buffer[8192];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+  std::fputs("[region-artifact-probe] ", stdout);
+  std::fputs(buffer, stdout);
+  std::fputc('\n', stdout);
+  std::fflush(stdout);
+}
+
+// A single line of the lowered IR, for the log.
+std::string one_line(std::string s) {
+  std::replace(s.begin(), s.end(), '\n', '|');
+  return s;
+}
+
+// Identity for counting invocations. The op list of the lowered IR is what the
+// .metadata carries and what DET hashed; the counters are left in because this
+// value only has to be stable within one process.
+std::string region_identity(const std::string& op_strs) {
+  std::hash<std::string> h;
+  return std::to_string(h(op_strs));
+}
+
+size_t count_const_id_inputs(
+    const at::ArrayRef<habana_torch::jit::IValue>& input_refs,
+    size_t& tensor_inputs) {
+  size_t with_const_id = 0;
+  tensor_inputs = 0;
+  for (const auto& input : input_refs) {
+    if (!input.isTensor()) {
+      continue;
+    }
+    ++tensor_inputs;
+    if (habana::is_tensor_const_with_valid_const_id(input.toTensor())) {
+      ++with_const_id;
+    }
+  }
+  return with_const_id;
+}
+
+std::string dims_str(const std::vector<int64_t>& dims) {
+  std::string s = "[";
+  for (size_t i = 0; i < dims.size(); ++i) {
+    s += (i != 0 ? "," : "") + std::to_string(dims[i]);
+  }
+  return s + "]";
+}
+
+// Bitwise comparison of one output pair. Returns true when identical.
+bool outputs_bitwise_equal(
+    const at::Tensor& live,
+    const at::Tensor& artifact,
+    std::string& detail) {
+  if (live.sizes() != artifact.sizes() ||
+      live.scalar_type() != artifact.scalar_type()) {
+    detail = "shape or dtype differs (live " + dims_str(live.sizes().vec()) +
+        " " + std::string(live.dtype().name()) + " vs artifact " +
+        dims_str(artifact.sizes().vec()) + " " +
+        std::string(artifact.dtype().name()) + ")";
+    return false;
+  }
+  auto a = live.detach().to(at::kCPU).contiguous();
+  auto b = artifact.detach().to(at::kCPU).contiguous();
+  const size_t nbytes = a.numel() * a.element_size();
+  if (std::memcmp(a.data_ptr(), b.data_ptr(), nbytes) == 0) {
+    detail = std::to_string(nbytes) + " bytes identical";
+    return true;
+  }
+  const auto* pa = static_cast<const uint8_t*>(a.data_ptr());
+  const auto* pb = static_cast<const uint8_t*>(b.data_ptr());
+  size_t differing = 0;
+  size_t first = nbytes;
+  for (size_t k = 0; k < nbytes; ++k) {
+    if (pa[k] != pb[k]) {
+      ++differing;
+      if (first == nbytes) {
+        first = k;
+      }
+    }
+  }
+  detail = std::to_string(differing) + " of " + std::to_string(nbytes) +
+      " bytes differ, first at byte " + std::to_string(first);
+  return false;
+}
+} // namespace
+
+// Called from the lowering thread, at the end of a cache-hit launch that matched
+// the selector. Copies what the probe needs and returns; all device work happens
+// in region_probe_drain().
+void region_probe_capture(
+    const std::string& identity,
+    const std::string& key,
+    const std::string& recipe_name,
+    const std::string& op_strs,
+    size_t ir_nodes,
+    size_t tensor_inputs,
+    size_t const_inputs,
+    std::shared_ptr<RecipeValueSpec> rvs,
+    std::shared_ptr<RecipeLauncher> rl,
+    const at::ArrayRef<habana_torch::jit::IValue>& inputs,
+    const VecOfIValPtrSh& outputs) {
+  PendingRegionProbe p;
+  p.valid = true;
+  p.identity = identity;
+  p.key = key;
+  p.recipe_name = recipe_name;
+  p.op_strs = op_strs;
+  p.ir_nodes = ir_nodes;
+  p.tensor_inputs = tensor_inputs;
+  p.const_inputs = const_inputs;
+  p.rvs = std::move(rvs);
+  p.rl = std::move(rl);
+  p.inputs.assign(inputs.begin(), inputs.end());
+  for (const auto& out : outputs) {
+    if (out && out->isTensor()) {
+      // Device-to-device copy. A D2D copy is enqueued and does not sync the host,
+      // so it is safe on the lowering thread (a D2H read-back there hangs), and it
+      // gives the comparison a private reference that a later launch cannot
+      // overwrite -- which matters for in-place outputs such as the KV cache.
+      p.outputs.push_back(out->toTensor().clone());
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_probe_pending_mutex);
+    g_probe_queue.push_back(std::move(p));
+  }
+  g_probe_pending.store(true);
+}
+
+// Called at the start of a region launch, from the thread that owns the stream.
+void region_probe_drain() {
+  if (!g_probe_pending.load(std::memory_order_relaxed)) {
+    return;
+  }
+  PendingRegionProbe p;
+  {
+    std::lock_guard<std::mutex> lock(g_probe_pending_mutex);
+    if (g_probe_queue.empty()) {
+      g_probe_pending.store(false, std::memory_order_relaxed);
+      return;
+    }
+    p = std::move(g_probe_queue.front());
+    g_probe_queue.pop_front();
+    if (g_probe_queue.empty()) {
+      g_probe_pending.store(false, std::memory_order_relaxed);
+    }
+  }
+
+  auto& state = region_probe_state();
+  const std::string dir =
+      state.dir + "/pid" + std::to_string(::getpid()) + "/" + p.identity;
+
+  // Quiesce the lowering thread first.  The plugin assumes exactly one thread
+  // issues launches; the probe is a second issuer, and synapse's address-lock /
+  // defragmentation path is not safe for two concurrent launches (measured: a
+  // segfault inside device_memory::lock_addresses during a real vLLM boot).
+  // The probe is a one-shot diagnostic, so waiting is cheap and correct.
+  HPUDeviceContext::lowering_thread().waitWorkComplete();
+
+  probe_printf(
+      "BEGIN region=%s ir_nodes=%zu recipe=%s key=%s",
+      p.identity.c_str(),
+      p.ir_nodes,
+      p.recipe_name.c_str(),
+      p.key.c_str());
+  probe_printf(
+      "region inputs tensor_inputs=%zu const_id_inputs=%zu "
+      "(ExecuteSynapseCache's const-section / checksum block touches only the "
+      "latter)",
+      p.tensor_inputs,
+      p.const_inputs);
+  probe_printf("region IR \"%.400s\"", one_line(p.op_strs).c_str());
+
+  // ---- 1. export from the live handle ------------------------------------
+  RecipeExportRecord rec;
+  try {
+    // The holder the cache would have handed the launch path, assembled from the
+    // two live halves: the launcher (which owns the synRecipeHandle) and the spec.
+    RecipeHolder holder(p.rl, p.rvs);
+    rec = habana::recipe_export(holder, dir, p.key);
+  } catch (const std::exception& e) {
+    probe_printf("EXPORT FAILED exception=%s", e.what());
+    return;
+  }
+  probe_printf(
+      "export recipe_bytes=%ju metadata_bytes=%ju serialize_status=%d "
+      "redeserialize=%d table_matches=%d",
+      rec.recipe_bytes,
+      rec.metadata_bytes,
+      rec.serialize_status,
+      rec.redeserialize_ok ? 1 : 0,
+      rec.table_matches ? 1 : 0);
+  if (!rec.table_matches) {
+    probe_printf("EXPORT TABLE MISMATCH %s", rec.mismatch.c_str());
+    return;
+  }
+  probe_printf(
+      "binding graph_name=%s ntensors=%zu tensor_ids=%zu inputs=%zu outputs=%zu "
+      "intermediates=%zu dma_inputs=%zu shape_tensors=%zu indups=%zu "
+      "input_to_outdups=%zu",
+      rec.live.graph_name.c_str(),
+      rec.live.fields.size(),
+      rec.live.tensor_ids.size(),
+      rec.live.num_inputs,
+      rec.live.num_outputs,
+      rec.live.num_intermediates,
+      rec.live.num_dma_inputs,
+      rec.live.num_shape_tensors,
+      rec.live.num_induplicates,
+      rec.live.num_input_to_outduplicates);
+  for (const auto& f : rec.live.fields) {
+    probe_printf(
+        "  field[%zu] name=%s ir=%s id=%llu dtype=%d type=%d dims=%s "
+        "nbytes=%llu is_output=%d dup=%d offset=%llu",
+        f.index,
+        f.syn_name.c_str(),
+        f.ir_name.c_str(),
+        static_cast<unsigned long long>(f.tensor_id),
+        f.dtype,
+        f.tensor_type,
+        dims_str(f.dims).c_str(),
+        static_cast<unsigned long long>(f.nbytes),
+        f.is_output ? 1 : 0,
+        f.is_duplicate ? 1 : 0,
+        static_cast<unsigned long long>(f.offset));
+  }
+
+  uintmax_t output_bytes = 0;
+  for (const auto& f : rec.live.fields) {
+    if (f.is_output) {
+      output_bytes += f.nbytes;
+    }
+  }
+  if (output_bytes > state.max_output_bytes) {
+    probe_printf(
+        "SKIP region outputs=%ju bytes > limit %ju (the probe would allocate a "
+        "second copy)",
+        output_bytes,
+        state.max_output_bytes);
+    return;
+  }
+  probe_printf("region outputs=%ju bytes", output_bytes);
+
+  // ---- 2. load it back as a PrecompiledRegion ----------------------------
+  std::shared_ptr<habana::PrecompiledRegion> region;
+  try {
+    region = habana::PrecompiledRegion::load(dir, p.key);
+  } catch (const std::exception& e) {
+    probe_printf("LOAD FAILED exception=%s", e.what());
+    return;
+  }
+  const auto loaded_binding = habana::describe_binding(region->rvs());
+  const bool binding_round_trips = (loaded_binding.text() == rec.live.text());
+  probe_printf(
+      "load ok metadata -> RecipeValueSpec + synRecipeDeSerialize -> handle; "
+      "binding_round_trips=%d",
+      binding_round_trips ? 1 : 0);
+
+  // ---- 3. launch from the artifact and compare bitwise -------------------
+  const c10::hpu::HPUStream& stream{c10::hpu::getCurrentHPUStream()};
+  const at::ArrayRef<habana_torch::jit::IValue> refs(p.inputs.data(), p.inputs.size());
+  std::vector<at::Tensor> artifact_outputs;
+  try {
+    region->launch_from(stream, refs, artifact_outputs);
+  } catch (const std::exception& e) {
+    probe_printf("ARTIFACT LAUNCH FAILED exception=%s", e.what());
+    return;
+  }
+  // Launch the same artifact a second time from the same inputs. If the two
+  // disagree, the region is nondeterministic and a bitwise comparison of it is
+  // meaningless -- that has to be reported, not folded into "no".
+  bool self_consistent = true;
+  {
+    std::vector<at::Tensor> again;
+    try {
+      region->launch_from(stream, refs, again);
+      if (again.size() != artifact_outputs.size()) {
+        self_consistent = false;
+      } else {
+        for (size_t i = 0; i < again.size(); ++i) {
+          std::string ignored;
+          if (!outputs_bitwise_equal(artifact_outputs[i], again[i], ignored)) {
+            self_consistent = false;
+            break;
+          }
+        }
+      }
+    } catch (const std::exception& e) {
+      probe_printf("ARTIFACT RELAUNCH FAILED exception=%s", e.what());
+      self_consistent = false;
+    }
+  }
+  if (p.outputs.size() != artifact_outputs.size()) {
+    probe_printf(
+        "ARTIFACT LAUNCH: output count differs live=%zu artifact=%zu",
+        p.outputs.size(),
+        artifact_outputs.size());
+    return;
+  }
+  bool equal = true;
+  std::string detail = "all outputs bit-identical";
+  for (size_t i = 0; i < p.outputs.size(); ++i) {
+    std::string one;
+    if (!outputs_bitwise_equal(p.outputs[i], artifact_outputs[i], one)) {
+      equal = false;
+      detail = "output " + std::to_string(i) + ": " + one;
+      break;
+    }
+  }
+  probe_printf(
+      "LAUNCH outputs=%zu bitwise_equal=%d %s",
+      p.outputs.size(),
+      equal ? 1 : 0,
+      detail.c_str());
+
+  // ---- 3b. negative control D: the comparison itself must be able to fail --
+  // Take the reference the comparison was just given, flip one byte of it, and
+  // require "unequal". This cannot be insensitive: it is the gate's own input that
+  // changes. Without it, an "equal" on a region whose inputs happen to be inert
+  // would be indistinguishable from a blind comparison.
+  bool gate_can_fail = false;
+  {
+    std::string ignored;
+    for (size_t i = 0; i < p.outputs.size(); ++i) {
+      auto tampered = p.outputs[i].detach().to(at::kCPU).contiguous().clone();
+      if (tampered.numel() == 0) {
+        continue;
+      }
+      auto* bytes = static_cast<uint8_t*>(tampered.data_ptr());
+      const size_t nbytes = tampered.numel() * tampered.element_size();
+      bytes[nbytes / 2] ^= 0xFF;
+      if (!outputs_bitwise_equal(tampered, artifact_outputs[i], ignored)) {
+        gate_can_fail = true;
+        break;
+      }
+    }
+  }
+  probe_printf(
+      "NEGATIVE CONTROL D (one byte of the reference flipped, compared against the "
+      "artifact output): gate_reports_unequal=%d",
+      gate_can_fail ? 1 : 0);
+
+  // ---- 4. negative control A: is the region sensitive to its inputs? -----
+  // Same artifact, same binding, one input perturbed on a *copy*. If the
+  // comparison still says "equal", the comparison is decoration and the result
+  // above means nothing.
+  // Try every floating-point input in turn with a large step. +1.0 on one element
+  // of a bf16 reduction is below bf16 resolution, so a single small perturbation
+  // proves nothing; a step that cannot be lost is the honest control.
+  bool negative_control_ran = false;
+  bool negative_control_differs = false;
+  int perturbed_idx = -1;
+  int tried = 0;
+  for (size_t i = 0; i < p.inputs.size() && !negative_control_differs && tried < 6;
+       ++i) {
+    if (!p.inputs[i].isTensor()) {
+      continue;
+    }
+    const auto type = p.inputs[i].toTensor().scalar_type();
+    if (type != at::kBFloat16 && type != at::kHalf && type != at::kFloat &&
+        type != at::kDouble) {
+      continue;
+    }
+    ++tried;
+    std::vector<habana_torch::jit::IValue> perturbed(p.inputs.begin(), p.inputs.end());
+    auto copy = p.inputs[i].toTensor().clone();
+    copy.add_(1024.0);
+    perturbed[i] = habana_torch::jit::IValue(copy);
+    std::vector<at::Tensor> perturbed_outputs;
+    try {
+      region->launch_from(
+          stream,
+          at::ArrayRef<habana_torch::jit::IValue>(
+              perturbed.data(), perturbed.size()),
+          perturbed_outputs);
+      negative_control_ran = true;
+      for (size_t k = 0;
+           k < perturbed_outputs.size() && k < p.outputs.size();
+           ++k) {
+        std::string ignored;
+        if (!outputs_bitwise_equal(p.outputs[k], perturbed_outputs[k], ignored)) {
+          negative_control_differs = true;
+          perturbed_idx = static_cast<int>(i);
+          break;
+        }
+      }
+    } catch (const std::exception& e) {
+      probe_printf(
+          "NEGATIVE CONTROL A: launch with input %zu perturbed failed: %s",
+          i,
+          e.what());
+    }
+  }
+  probe_printf(
+      "NEGATIVE CONTROL A (each floating input + 1024.0, on a copy, %d tried): "
+      "ran=%d output_moved=%d input=%d%s",
+      tried,
+      negative_control_ran ? 1 : 0,
+      negative_control_differs ? 1 : 0,
+      perturbed_idx,
+      !self_consistent
+          ? " (region is nondeterministic, so this says nothing)"
+          : (negative_control_differs
+                 ? " -> the launch reads its inputs"
+                 : (tried == 0
+                        ? " -> no floating-point input to perturb"
+                        : " -> NOT input-sensitive under this test (open question, "
+                          "reported in the report)")));
+
+  // ---- 5. negative control B: a corrupted blob must not load -------------
+  bool corruption_rejected = false;
+  {
+    const std::string bad_path = dir + "/" + p.key + ".corrupt.recipe";
+    std::error_code ec;
+    std::filesystem::copy_file(
+        rec.recipe_path,
+        bad_path,
+        std::filesystem::copy_options::overwrite_existing,
+        ec);
+    if (!ec) {
+      std::fstream f(bad_path, std::ios::in | std::ios::out | std::ios::binary);
+      f.seekg(0, std::ios::end);
+      const auto size = static_cast<uintmax_t>(f.tellg());
+      f.seekg(static_cast<std::streamoff>(size / 2), std::ios::beg);
+      char c = 0;
+      f.read(&c, 1);
+      c = static_cast<char>(c ^ 0xFF);
+      f.seekp(static_cast<std::streamoff>(size / 2), std::ios::beg);
+      f.write(&c, 1);
+      f.close();
+      synRecipeHandle handle = nullptr;
+      const auto status = synRecipeDeSerialize(&handle, bad_path.c_str());
+      corruption_rejected = (status != synSuccess);
+      if (corruption_rejected) {
+        synRecipeDestroy(handle);
+      }
+    }
+  }
+  probe_printf(
+      "NEGATIVE CONTROL B (one byte flipped mid-blob): deserialize_rejected=%d",
+      corruption_rejected ? 1 : 0);
+
+  // ---- 5b. negative control C: a truncated blob must not load ------------
+  // The failure mode C8 warns about: a copy taken while the plugin's cache
+  // background thread was still writing is a valid-looking truncation.
+  bool truncation_rejected = false;
+  {
+    const std::string short_path = dir + "/" + p.key + ".truncated.recipe";
+    std::error_code ec;
+    std::filesystem::copy_file(
+        rec.recipe_path,
+        short_path,
+        std::filesystem::copy_options::overwrite_existing,
+        ec);
+    if (!ec) {
+      std::error_code size_ec;
+      const auto full = std::filesystem::file_size(short_path, size_ec);
+      std::filesystem::resize_file(short_path, (full * 3) / 5, size_ec);
+      synRecipeHandle handle = nullptr;
+      const auto status = synRecipeDeSerialize(&handle, short_path.c_str());
+      truncation_rejected = (status != synSuccess);
+      if (truncation_rejected) {
+        synRecipeDestroy(handle);
+      }
+      probe_printf(
+          "NEGATIVE CONTROL C (blob truncated to 60%% of %ju bytes): "
+          "deserialize_status=%d rejected=%d",
+          full,
+          static_cast<int>(status),
+          truncation_rejected ? 1 : 0);
+    }
+  }
+
+  const bool verdict = equal && self_consistent && gate_can_fail;
+  probe_printf(
+      "VERDICT U1=%s artifact_launch_bitwise_equal=%d artifact_self_consistent=%d "
+      "gate_can_fail=%d input_sensitive=%d corrupt_blob_rejected=%d "
+      "truncated_blob_rejected=%d binding_round_trips=%d",
+      verdict ? "yes"
+              : (!self_consistent ? "uncomparable"
+                                  : (!equal ? "no" : "unproven")),
+      equal ? 1 : 0,
+      self_consistent ? 1 : 0,
+      gate_can_fail ? 1 : 0,
+      negative_control_differs ? 1 : 0,
+      corruption_rejected ? 1 : 0,
+      truncation_rejected ? 1 : 0,
+      binding_round_trips ? 1 : 0);
+  probe_printf("artifact_dir=%s", dir.c_str());
+}
+
+// Runs on the lowering thread, at the end of a cache-hit launch: decide whether
+// this region is the one under test and, if so, capture it.
+void HabanaLaunchOpPT::ProbeRegionArtifact() {
+  auto& state = region_probe_state();
+  if (!state.armed) {
+    return;
+  }
+  if (cur_rvalpsh_ == nullptr || recipe_launcher_ == nullptr ||
+      recipe_launcher_->recipe_ == nullptr) {
+    // Compile path, or an empty recipe: nothing to export.
+    return;
+  }
+
+  const std::string& op_strs = op_strs_;
+  const std::string recipe_name = recipe_launcher_->recipe_->recipe_name_;
+  const size_t ir_nodes = jit_ir_graph_ != nullptr
+      ? static_cast<size_t>(std::distance(
+            jit_ir_graph_->nodes().begin(), jit_ir_graph_->nodes().end()))
+      : 0;
+
+  bool matches = state.list_only || (state.selector == "*") ||
+      (op_strs.find(state.selector) != std::string::npos) ||
+      (recipe_name.find(state.selector) != std::string::npos);
+  if (matches && state.nodes_filter != 0 && ir_nodes != state.nodes_filter) {
+    matches = false;
+  }
+  if (!matches) {
+    return;
+  }
+
+  const std::string identity = region_identity(op_strs);
+
+  if (state.list_only) {
+    std::lock_guard<std::mutex> lock(state.mtx);
+    if (!state.listed.emplace(identity, true).second) {
+      return;
+    }
+    size_t tensor_inputs = 0;
+    const size_t const_inputs = count_const_id_inputs(input_refs_, tensor_inputs);
+    probe_printf(
+        "list ir_nodes=%zu jit_inputs=%zu recipe=%s const_id_inputs=%zu/%zu "
+        "tensors=%zu ir=\"%.300s\"",
+        ir_nodes,
+        input_refs_.size(),
+        recipe_name.c_str(),
+        const_inputs,
+        tensor_inputs,
+        cur_rvalpsh_->dtensorinfos.size(),
+        one_line(op_strs).c_str());
+    return;
+  }
+
+  long invocation = 0;
+  {
+    std::lock_guard<std::mutex> lock(state.mtx);
+    invocation = ++state.counts[identity];
+  }
+  if (invocation != state.at_call) {
+    return;
+  }
+
+  size_t tensor_inputs = 0;
+  const size_t const_inputs = count_const_id_inputs(input_refs_, tensor_inputs);
+  const std::string key = std::to_string(
+      cur_rargpsh_ != nullptr ? cur_rargpsh_->hashCode() : cur_rvalpsh_->get_key());
+  habana::region_probe_capture(
+      identity,
+      key,
+      recipe_name,
+      op_strs,
+      ir_nodes,
+      tensor_inputs,
+      const_inputs,
+      cur_rvalpsh_,
+      recipe_launcher_,
+      input_refs_,
+      aten_outputs_);
+}
+
+void HabanaLaunchOpPT::DumpStaticCompilationStatistics(    size_t graph_key_with_perm,
     bool is_compile) {
   habana_helpers::ResultShapes ranges;
 
@@ -5241,6 +5932,7 @@ void HabanaLaunchOpPT::run(
 
     if (ABSL_PREDICT_TRUE(recipe_holder)) {
       recipe_launcher_ = recipe_holder->rl_;
+      cur_rvalpsh_ = recipe_holder->rvs_;
       auto& rvs = *recipe_holder->rvs_;
       emitCacheEvent(
           habana_helpers::EventDispatcher::Topic::CACHE_HIT,

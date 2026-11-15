@@ -11,6 +11,10 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Modified here. The original licence above is Apache-2.0; the changes in this
+ * file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+ * recorded rather than hidden, as AGENTS.md requires.
  */
 
 #include <pybind11/stl.h>
@@ -208,6 +212,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     auto& graph_storage{habana::graph::GraphStorage::get()};
     graph_storage.reset_seeds();
   });
+  // Load a persisted (recipe, metadata) pair into GraphStorage as a region.
+  // The id it returns is launched with the ordinary graph_launch above, which is
+  // the point: the launch path is unchanged, only where the RecipeHolder came
+  // from differs.
+  m.def(
+      "precompiled_load",
+      [](const std::string& dir, const std::string& key) {
+        auto& graph_storage{habana::graph::GraphStorage::get()};
+        return graph_storage.add_precompiled_recipe(dir, key);
+      },
+      py::arg("dir"),
+      py::arg("key"));
   py::class_<EmptyBatchData>(m, "EmptyBatchData")
       .def(
           py::init<

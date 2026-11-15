@@ -11,6 +11,10 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Modified here. The original licence above is Apache-2.0; the changes in this
+ * file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+ * recorded rather than hidden, as AGENTS.md requires.
  */
 
 #pragma once
@@ -501,6 +505,135 @@ struct RecipeHolder {
 
   size_t Size() const {
     return rl_->Size() + rvs_->Size();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Precompiled region.
+//
+// A launch reconstructed from a persisted (recipe blob, metadata) pair.  No JIT
+// IR graph, no HabanaLaunchOpPT, no graph_compile: the recipe is re-created by
+// synRecipeDeSerialize and the launch binding is the persisted RecipeValueSpec.
+// The launch itself is the plugin's own cache-hit launch --
+// update_patching_table + patch_launch_info + RecipeLauncher::Launch -- which is
+// the whole point: if this works, the warm path is the existing hit path with
+// graph_compile replaced by a load (DESIGN.md Appendix A.1).
+// ---------------------------------------------------------------------------
+
+// One line per launch tensor, as the recipe's own launch table describes it.
+struct LaunchBindingField {
+  size_t index{0};
+  std::string syn_name;
+  uint64_t tensor_id{0};
+  int dtype{0};
+  int tensor_type{0};
+  std::vector<int64_t> dims; // torch order, as the recipe stores it
+  std::vector<uint64_t> syn_shape;
+  uint64_t nbytes{0};
+  bool is_output{false};
+  bool is_duplicate{false};
+  size_t parent_index{0};
+  uint64_t offset{0};
+  std::string ir_name;
+};
+
+// The binding: what the artifact has to carry for a launch to be possible.
+struct LaunchBinding {
+  std::string graph_name;
+  size_t num_inputs{0};
+  size_t num_induplicates{0};
+  size_t num_dma_inputs{0};
+  size_t num_shape_tensors{0};
+  size_t num_intermediates{0};
+  size_t num_outputs{0};
+  size_t num_outduplicates{0};
+  size_t num_input_to_outduplicates{0};
+  size_t num_intermediate_to_outduplicates{0};
+  size_t num_output_to_outduplicates{0};
+  bool dynamic_graph{false};
+  std::vector<uint64_t> tensor_ids;
+  std::vector<LaunchBindingField> fields;
+
+  // Stable text form: equality of two bindings is equality of these strings.
+  std::string text() const;
+};
+
+LaunchBinding describe_binding(const RecipeValueSpec& rvs);
+
+// What recipe_export had to write, and whether the file it wrote reads back to
+// the same launch table (DESIGN.md §8 step 2).
+struct RecipeExportRecord {
+  std::string key;
+  std::string recipe_path;
+  std::string metadata_path;
+  bool has_recipe{false};
+  int serialize_status{-1};
+  uintmax_t recipe_bytes{0};
+  uintmax_t metadata_bytes{0};
+  bool redeserialize_ok{false};
+  int redeserialize_status{-1};
+  bool table_matches{false};
+  std::string mismatch;
+  LaunchBinding live;
+  LaunchBinding loaded;
+};
+
+RecipeExportRecord recipe_export(
+    const RecipeHolder& holder,
+    const std::string& dir,
+    const std::string& key);
+
+// Env-gated region-artifact probe (DESIGN.md §12 stage 1). Split in two because
+// the two halves must run on different threads: capture happens on the lowering
+// thread, where the live RecipeValueSpec / synRecipeHandle / patched inputs and
+// outputs exist; the probe itself runs on the next region launch from the thread
+// that owns the stream, because a synchronous device read-back on the lowering
+// thread deadlocks (measured).
+void region_probe_capture(
+    const std::string& identity,
+    const std::string& key,
+    const std::string& recipe_name,
+    const std::string& op_strs,
+    size_t ir_nodes,
+    size_t tensor_inputs,
+    size_t const_inputs,
+    std::shared_ptr<RecipeValueSpec> rvs,
+    std::shared_ptr<RecipeLauncher> rl,
+    const at::ArrayRef<habana_torch::jit::IValue>& inputs,
+    const VecOfIValPtrSh& outputs);
+
+// Runs the captured probe, if any. One relaxed atomic load when there is none.
+void region_probe_drain();
+
+struct PrecompiledRegion {
+  std::shared_ptr<RecipeHolder> holder_;
+  std::string key_;
+  std::string dir_;
+
+  // Reads <dir>/<key>.metadata + <dir>/<key>.recipe. Throws on any failure: a
+  // half-loaded region must never be launchable.
+  static std::shared_ptr<PrecompiledRegion> load(
+      const std::string& dir,
+      const std::string& key);
+
+  // The stream is the caller's, exactly as the cache-hit path uses
+  // HabanaLaunchOpPT's hpu_stream_: a launch submitted on a different stream than
+  // the one the inputs were produced on would be unordered with them.
+  torch::jit::Stack launch_from(
+      synapse_helpers::hpuStream_t stream,
+      at::ArrayRef<habana_torch::jit::IValue> input_refs,
+      std::vector<at::Tensor>& outputs);
+
+  // Same, for a torch::jit::Stack of exactly this region's inputs.
+  torch::jit::Stack launch(
+      torch::jit::Stack& inputs,
+      std::vector<at::Tensor>& outputs);
+
+  const RecipeValueSpec& rvs() const {
+    return *holder_->rvs_;
+  }
+  const RecipeLauncher& rl() const {
+    return *holder_->rl_;
   }
 };
 

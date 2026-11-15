@@ -11,11 +11,20 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Modified here. The original licence above is Apache-2.0; the changes in this
+ * file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+ * recorded rather than hidden, as AGENTS.md requires.
  */
 
 #include "backend/kernel/hpu_habana_cache.h"
+#include <synapse_api.h>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include "backend/backend_meta.h"
+#include "backend/habana_device/HPUStream.h"
 #include "backend/helpers/collective_kernel_info.h"
 #include "backend/helpers/generic_resource_holder.h"
 #include "backend/helpers/record_stream_utils.h"
@@ -2064,5 +2073,272 @@ void DynamicBucketInfoMap::refine_graph(
 void ClearDynamicBucketRecipeInfo() {
   HPUDeviceContext::recipe_cache().clear();
   DynamicBucketInfoMap::get_instance().clear();
+}
+
+// ---------------------------------------------------------------------------
+// Precompiled region: export, load, launch.
+// ---------------------------------------------------------------------------
+
+std::string LaunchBinding::text() const {
+  std::ostringstream os;
+  os << "graph_name=" << graph_name << " dynamic=" << dynamic_graph
+     << " num_inputs=" << num_inputs << " num_induplicates=" << num_induplicates
+     << " num_dma_inputs=" << num_dma_inputs
+     << " num_shape_tensors=" << num_shape_tensors
+     << " num_intermediates=" << num_intermediates
+     << " num_outputs=" << num_outputs
+     << " num_outduplicates=" << num_outduplicates
+     << " num_input_to_outduplicates=" << num_input_to_outduplicates
+     << " num_intermediate_to_outduplicates="
+     << num_intermediate_to_outduplicates
+     << " num_output_to_outduplicates=" << num_output_to_outduplicates
+     << " ntensor_ids=" << tensor_ids.size() << " ntensors=" << fields.size()
+     << "\n";
+  for (const auto& f : fields) {
+    os << "  [" << f.index << "] name=" << f.syn_name << " ir=" << f.ir_name
+       << " id=" << f.tensor_id << " dtype=" << f.dtype
+       << " type=" << f.tensor_type << " dims=";
+    for (auto d : f.dims) {
+      os << d << ",";
+    }
+    os << " synshape=";
+    for (auto d : f.syn_shape) {
+      os << d << ",";
+    }
+    os << " nbytes=" << f.nbytes << " is_output=" << f.is_output
+       << " dup=" << f.is_duplicate << " parent=" << f.parent_index
+       << " offset=" << f.offset << "\n";
+  }
+  return os.str();
+}
+
+LaunchBinding describe_binding(const RecipeValueSpec& rvs) {
+  LaunchBinding b;
+  b.graph_name = rvs.get_graph_name();
+  b.num_inputs = rvs.num_inputs;
+  b.num_induplicates = rvs.num_induplicates;
+  b.num_dma_inputs = rvs.num_dma_inputs;
+  b.num_shape_tensors = rvs.num_shape_tensors;
+  b.num_intermediates = rvs.num_intermediates;
+  b.num_outputs = rvs.num_outputs;
+  b.num_outduplicates = rvs.num_outduplicates;
+  b.num_input_to_outduplicates = rvs.num_input_to_outduplicates;
+  b.num_intermediate_to_outduplicates = rvs.num_intermediate_to_outduplicates;
+  b.num_output_to_outduplicates = rvs.num_output_to_outduplicates;
+  b.dynamic_graph = rvs.dynamic_graph;
+  b.tensor_ids = rvs.tensor_ids_;
+  b.fields.reserve(rvs.dtensorinfos.size());
+  for (size_t i = 0; i < rvs.dtensorinfos.size(); ++i) {
+    const PtTensorInfo& ti = *rvs.dtensorinfos[i];
+    LaunchBindingField f;
+    f.index = i;
+    f.syn_name = ti.get_syn_name();
+    f.ir_name = ti.get_ir_name();
+    f.tensor_id = ti.get_tensor_id();
+    f.dtype = static_cast<int>(ti.get_topts().dtype().toScalarType());
+    f.tensor_type = static_cast<int>(ti.tensor_type());
+    f.dims = ti.get_shape();
+    for (auto d : ti.syn_shape()) {
+      f.syn_shape.push_back(d);
+    }
+    f.nbytes = ti.get_size();
+    f.is_output = ti.is_output();
+    f.is_duplicate = ti.is_duplicate();
+    f.parent_index = ti.get_parent_index();
+    f.offset = ti.get_offset();
+    b.fields.push_back(std::move(f));
+  }
+  return b;
+}
+
+RecipeExportRecord recipe_export(
+    const RecipeHolder& holder,
+    const std::string& dir,
+    const std::string& key) {
+  RecipeExportRecord rec;
+  rec.key = key;
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  rec.recipe_path = dir + "/" + key + ".recipe";
+  rec.metadata_path = dir + "/" + key + ".metadata";
+
+  const RecipeLauncher& rl = *holder.rl_;
+  const RecipeValueSpec& rvs = *holder.rvs_;
+  rec.live = describe_binding(rvs);
+  rec.has_recipe =
+      (rl.recipe_ != nullptr && rl.recipe_->syn_recipe_handle_ != nullptr);
+
+  if (rec.has_recipe) {
+    // Serialize from the LIVE handle, synchronously. Never copy the plugin's
+    // cache: it is written by a background thread, and a copy taken too early is
+    // a valid-looking truncation (DESIGN.md C8).
+    auto status =
+        synRecipeSerialize(rl.recipe_->syn_recipe_handle_, rec.recipe_path.c_str());
+    rec.serialize_status = static_cast<int>(status);
+    if (status != synSuccess) {
+      PT_BRIDGE_WARN(
+          "recipe_export: synRecipeSerialize failed for ", key, " status ",
+          static_cast<int>(status));
+      return rec;
+    }
+    rec.recipe_bytes = std::filesystem::file_size(rec.recipe_path, ec);
+  }
+
+  {
+    std::stringstream ss;
+    holder.Serialize(ss);
+    std::ofstream metadata_file(rec.metadata_path, std::ofstream::binary);
+    if (!metadata_file.is_open()) {
+      PT_BRIDGE_WARN("recipe_export: cannot open ", rec.metadata_path);
+      return rec;
+    }
+    metadata_file << ss.str();
+    metadata_file.flush();
+    metadata_file.close();
+    rec.metadata_bytes = std::filesystem::file_size(rec.metadata_path, ec);
+  }
+
+  if (!rec.has_recipe) {
+    return rec;
+  }
+
+  // Self-check (§8 step 2): re-open the file we just wrote, deserialize it, and
+  // compare its launch table to the in-memory one. A mismatch means we must not
+  // commit this artifact.
+  synRecipeHandle reloaded_handle = nullptr;
+  auto status =
+      synRecipeDeSerialize(&reloaded_handle, rec.recipe_path.c_str());
+  rec.redeserialize_status = static_cast<int>(status);
+  if (status != synSuccess) {
+    PT_BRIDGE_WARN(
+        "recipe_export: synRecipeDeSerialize of the file just written failed "
+        "for ",
+        key,
+        " status ",
+        static_cast<int>(status));
+    return rec;
+  }
+  rec.redeserialize_ok = true;
+  {
+    std::ifstream metadata_file(rec.metadata_path, std::ifstream::binary);
+    std::stringstream ss;
+    ss << metadata_file.rdbuf();
+    RecipeHolder loaded(ss, reloaded_handle);
+    rec.loaded = describe_binding(*loaded.rvs_);
+  }
+  synRecipeDestroy(reloaded_handle);
+
+  rec.table_matches = (rec.live.text() == rec.loaded.text());
+  if (!rec.table_matches) {
+    // First differing line, so the failure names itself.
+    const auto a = rec.live.text();
+    const auto b = rec.loaded.text();
+    size_t la = 0;
+    size_t lb = 0;
+    size_t line = 0;
+    while (la < a.size() && lb < b.size()) {
+      const auto ea = a.find('\n', la);
+      const auto eb = b.find('\n', lb);
+      if (ea == std::string::npos || eb == std::string::npos) {
+        break;
+      }
+      if (a.compare(la, ea - la, b, lb, eb - lb) != 0) {
+        rec.mismatch = "line " + std::to_string(line) + ":\n    live:   " +
+            a.substr(la, ea - la) + "\n    loaded: " + b.substr(lb, eb - lb);
+        break;
+      }
+      la = ea + 1;
+      lb = eb + 1;
+      ++line;
+    }
+    if (rec.mismatch.empty()) {
+      rec.mismatch = "line count differs";
+    }
+  }
+  return rec;
+}
+
+std::shared_ptr<PrecompiledRegion> PrecompiledRegion::load(
+    const std::string& dir,
+    const std::string& key) {
+  const std::string metadata_path = dir + "/" + key + ".metadata";
+  const std::string recipe_path = dir + "/" + key + ".recipe";
+
+  std::ifstream metadata_file(metadata_path, std::ifstream::binary);
+  if (!metadata_file.is_open()) {
+    HABANA_ASSERT(false, "PrecompiledRegion: no metadata at ", metadata_path);
+  }
+  std::stringstream ss;
+  ss << metadata_file.rdbuf();
+  metadata_file.close();
+
+  synRecipeHandle handle = nullptr;
+  auto status = synRecipeDeSerialize(&handle, recipe_path.c_str());
+  HABANA_ASSERT(
+      status == synSuccess,
+      "PrecompiledRegion: synRecipeDeSerialize failed for ",
+      recipe_path,
+      " status ",
+      static_cast<int>(status));
+
+  auto region = std::make_shared<PrecompiledRegion>();
+  region->key_ = key;
+  region->dir_ = dir;
+  region->holder_ = std::make_shared<RecipeHolder>(ss, handle);
+  return region;
+}
+
+torch::jit::Stack PrecompiledRegion::launch_from(
+    synapse_helpers::hpuStream_t stream,
+    at::ArrayRef<habana_torch::jit::IValue> input_refs,
+    std::vector<at::Tensor>& outputs) {
+  RecipeValueSpec& rvs = *holder_->rvs_;
+  RecipeLauncher& rl = *holder_->rl_;
+
+  // The two patching calls plus the launch: exactly the plugin's cache-hit path,
+  // with the RecipeHolder coming from a file instead of from graph_compile.
+  auto intermediates = std::make_shared<VecOfIValPtrSh>();
+  VecOfIValPtrSh dma_inputs;
+  VecOfIValPtrSh aten_outputs(rvs.get_aten_output_num());
+  // Only consulted for a dynamic graph; a precompiled region is static by
+  // construction (a dynamic recipe would need the symbol values that the JIT IR
+  // graph is the only source of).
+  habana::IdShapeMap actual_shapes;
+  rvs.update_patching_table(
+      input_refs, intermediates, dma_inputs, aten_outputs, actual_shapes);
+
+  std::vector<synLaunchTensorInfo> syn_launch_info;
+  std::vector<size_t> external_tensor_info_indexes;
+  if (rl.recipe_ != nullptr) {
+    rvs.patch_launch_info(syn_launch_info, external_tensor_info_indexes);
+  }
+
+  rl.Launch(
+      stream,
+      input_refs,
+      intermediates,
+      aten_outputs,
+      syn_launch_info,
+      external_tensor_info_indexes,
+      dma_inputs);
+
+  outputs.clear();
+  outputs.reserve(aten_outputs.size());
+  for (auto& out : aten_outputs) {
+    if (out && out->isTensor()) {
+      outputs.push_back(out->toTensor());
+    }
+  }
+  return {};
+}
+
+torch::jit::Stack PrecompiledRegion::launch(
+    torch::jit::Stack& inputs,
+    std::vector<at::Tensor>& outputs) {
+  const c10::hpu::HPUStream& stream{c10::hpu::getCurrentHPUStream()};
+  return launch_from(
+      stream,
+      at::ArrayRef<habana_torch::jit::IValue>(inputs.data(), inputs.size()),
+      outputs);
 }
 } // namespace habana

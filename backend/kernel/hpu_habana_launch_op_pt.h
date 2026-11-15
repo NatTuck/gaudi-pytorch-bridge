@@ -11,6 +11,10 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Modified here. The original licence above is Apache-2.0; the changes in this
+ * file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+ * recorded rather than hidden, as AGENTS.md requires.
  */
 #pragma once
 
@@ -325,7 +329,11 @@ class HabanaLaunchOpPT {
   void ExecuteSynapse();
   void ExecuteSynapseGraph();
   void ExecuteSynapseCache();
-  // To clear the static variables
+  // Env-gated (VLLM_HPU_REGION_ARTIFACT_PROBE): export this region's recipe and
+  // metadata from the live handle, load them back into a PrecompiledRegion, launch
+  // it, and compare the two outputs bitwise. Does nothing when the variable is
+  // unset. Answers DESIGN.md U1 inside the real process.
+  void ProbeRegionArtifact();  // To clear the static variables
   void ClearStatics(bool is_shape_inference = false);
   void RemoveDuplicateGraph();
 
@@ -503,6 +511,9 @@ class HabanaLaunchOpPT {
   size_t num_inputs_{0};
   std::shared_ptr<habana_helpers::DynamicBucketInfo> current_dbipsh_{};
   std::shared_ptr<RecipeArgumentSpec> cur_rargpsh_{nullptr};
+  // The RecipeValueSpec the current recipe_launcher_ came from. Only read by the
+  // env-gated region-artifact probe; nullptr on the compile (cache-miss) path.
+  std::shared_ptr<RecipeValueSpec> cur_rvalpsh_{nullptr};
   std::unique_ptr<PersistenceMarkerPassData> persistence_marker_pass_data_ptr_;
   std::unique_ptr<FuseCollectiveViewPassData>
       fuse_collective_view_pass_data_ptr_;
