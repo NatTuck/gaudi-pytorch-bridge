@@ -14,6 +14,7 @@
 ###############################################################################
 
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
@@ -127,3 +128,105 @@ class ColorGraph:
 class SchedulePolicy(Enum):
     # default mode, based on original execution order
     strict = 1
+
+
+# ---------------------------------------------------------------------------
+# Provenance propagation for passes that mint a replacement node
+# ---------------------------------------------------------------------------
+#
+# A pass that does
+#
+#     new = graph.call_function(...)
+#     old.replace_all_uses_with(new)
+#     graph.erase_node(old)
+#
+# starts ``new`` with an empty ``meta``.  Everything the graph knew about
+# ``old`` -- above all the source line a profiler or a recipe-numbering consumer
+# attributes it to -- is gone, and it is gone for exactly the nodes a reader most
+# wants to attribute (the ones a rewrite touched).  ``torch.fx`` gives no warning:
+# ``node_copy`` copies meta, ``call_function`` does not.
+#
+# ``PROVENANCE_META_KEYS`` is an allow-list, not "copy all of meta", and the
+# distinction is deliberate.  The rest of ``meta`` describes *the computation the
+# old node performed* -- ``val``, ``output_shapes``, ``output_strides``,
+# ``output_contiguous``, ``output_offset``, ``dtype``, ``device``, ``placement``,
+# ``partition_assigned``, ...  Those are re-derived by the pass that owns them
+# (``fill_propagated_tensor_metadata_to_node`` here, ``pass_fake_propagation``
+# later) and copying a stale one across a rewrite would assert something about a
+# node that has not been measured yet.
+
+PROVENANCE_META_KEYS = ("stack_trace", "source_fn_stack", "nn_module_stack")
+"""The ``meta`` keys that say *where a node came from*, not *what it computes*.
+
+``stack_trace``
+    The Python stack that produced the node.  This is the only per-node source
+    attribution the FX graph carries, and it is what ``region_identity`` numbers
+    recipes by (``foo.1 .. foo.N`` ordered by the minimum source line among a
+    recipe's nodes).  A replacement node without it makes the recipe place on
+    partial evidence.
+
+``source_fn_stack``
+    dynamo's ``[(name, fn), ...]`` chain of the functions the node came from.
+    Nothing in this bridge reads it (``grep -rn source_fn_stack`` over
+    ``compile_backend`` returns nothing), but it is pure provenance about the
+    same source expression, so it costs nothing to keep and it is what external
+    tooling (``torch._dynamo``'s repro/debug helpers) attributes by.
+
+``nn_module_stack``
+    The enclosing ``nn.Module`` path.  This bridge *does* read it:
+    ``propagate_module_names`` (``passes.py``, called from ``pass_compile_clusters``
+    at the POST_PARTITIONER stage) filters FX nodes on ``"nn_module_stack" in
+    node.meta`` before naming the JIT IR nodes, so a node inside a fused partition
+    that loses it silently drops out of the IR name mapping.  ``scalar_reorder``
+    runs at PRE_PLACEMENT, i.e. before the node is clustered, so this is exactly
+    the key it must not drop.
+
+``original_aten`` is deliberately NOT carried.  It is not provenance: it asserts
+"this node is the decomposition of that aten op", and ``is_decomposed_from_inplace_node``
+(``_helpers/helpers.py``) compares a node's own target against it.  A node minted
+by a *rewrite* is not a decomposition, so carrying the key would make that
+predicate lie -- ``div(scalar, tensor)`` rewritten to ``mul(reciprocal(t), scalar)``
+would report itself as a decomposition of ``aten.div.Tensor``.
+"""
+
+_STACK_TRACE_SITE_RE = re.compile(r'File "(?P<file>[^"]+)", line (?P<line>\d+), in (?P<func>[^\s]+)')
+
+
+def stack_trace_site(trace: str | None) -> tuple[str, int] | None:
+    """The innermost ``(file, line)`` of an FX ``meta["stack_trace"]``, or ``None``.
+
+    A trace holds one frame per inlined call, outermost first.  We take the *last*
+    match -- the innermost frame -- because that is the line that produced the node.
+    This is the same rule ``region_identity.node_sites`` applies, which matters:
+    if the two disagreed, a pass that "fixed" the trace would change the numbering.
+    """
+    if not trace:
+        return None
+    matches = list(_STACK_TRACE_SITE_RE.finditer(trace))
+    if not matches:
+        return None
+    return (matches[-1].group("file"), int(matches[-1].group("line")))
+
+
+def copy_provenance_meta(
+    src: torch.fx.Node,
+    dst: torch.fx.Node,
+    overrides: dict | None = None,
+) -> torch.fx.Node:
+    """Copy the provenance keys of *src* onto *dst* (a replacement for *src*).
+
+    ``overrides`` replaces an individual key; a value of ``None`` means "do not
+    set that key at all" (used by view-chain fusion, which cannot honestly claim a
+    single ``stack_trace``).  Returns *dst* so call sites read as one expression.
+    """
+    overrides = overrides or {}
+    for key in PROVENANCE_META_KEYS:
+        if key in overrides:
+            continue
+        if key in src.meta:
+            dst.meta[key] = src.meta[key]
+    for key, value in overrides.items():
+        if value is not None:
+            dst.meta[key] = value
+    return dst
+

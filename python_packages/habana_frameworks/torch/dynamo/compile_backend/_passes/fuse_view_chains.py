@@ -21,7 +21,7 @@ from .._helpers import (
     fill_propagated_tensor_metadata_to_node,
     is_view_node,
 )
-from .utils import OptimizerContext
+from .utils import OptimizerContext, copy_provenance_meta, stack_trace_site
 
 logger = get_compile_backend_logger()
 
@@ -41,6 +41,66 @@ supported_view_ops = [
     "split_with_sizes",
     "alias",
 ]
+
+
+def _fused_view_provenance(chain: list, fused_node: torch.fx.Node) -> None:
+    """Give a fused ``as_strided`` the provenance of the chain it replaces.
+
+    A fused view chain has **no single source line**.  ``t = x.transpose(0, 1)`` on
+    one statement and ``u = t.view(...)`` on the next are two lines, and the
+    ``as_strided`` that replaces both is neither of them.  Inventing one line
+    would be worse than the bug this fixes, so instead:
+
+    1. ``meta["stack_trace"]`` is set to the trace of the contributing node with
+       the **smallest source line**.  That is not a claim about which line the
+       fused node "is"; it is the value that keeps the recipe's numbering
+       identical to the unfused graph's.  ``region_identity.recipe_shape`` places
+       a recipe at the minimum line among its nodes, so a chain at lines {20, 24}
+       contributed ``20`` before fusion and must still contribute ``20`` after it.
+       (Carrying the *root* would usually give the same number, but only because
+       source order and data order agree in straight-line code.  Carrying the
+       *leaf* would report 24 and silently shift the recipe.)
+
+    2. ``meta["stack_traces"]`` keeps every distinct contributing trace, in chain
+       order, so the whole evidence survives rather than a chosen representative.
+
+    3. ``meta["multi_source"]`` is set when the contributing traces name more than
+       one distinct source line, so a consumer that needs a single line -- the
+       numbering module does -- can *report* the node instead of quietly trusting
+       the minimum.  ``region_identity.node_sites`` reads exactly this pair.
+
+    ``nn_module_stack`` / ``source_fn_stack`` come from the leaf: the fused node
+    produces the leaf's value, so the leaf's module and source chain are the ones
+    the result belongs to.
+    """
+    traces: list[str] = []
+    for node in chain:
+        trace = (getattr(node, "meta", None) or {}).get("stack_trace")
+        if trace and trace not in traces:
+            traces.append(trace)
+
+    sites = []
+    for trace in traces:
+        site = stack_trace_site(trace)
+        if site is not None:
+            sites.append((site, trace))
+
+    # min over (file, line) so the choice is total; None means "do not set
+    # stack_trace at all" -- with no contributing trace there is nothing honest
+    # to put there.
+    best_trace = min(sites, key=lambda st: st[0])[1] if sites else None
+    copy_provenance_meta(chain[-1], fused_node, overrides={"stack_trace": best_trace})
+
+    if traces:
+        fused_node.meta["stack_traces"] = tuple(traces)
+        lines = {site[1] for site, _ in sites}
+        if len(lines) > 1:
+            fused_node.meta["multi_source"] = True
+            logger.debug(
+                f"fused as_strided {fused_node.name} replaces view nodes on "
+                f"{len(lines)} distinct source lines {sorted(lines)}; "
+                f"placed at the minimum"
+            )
 
 
 def pass_fuse_view_chains(ctx: OptimizerContext) -> bool:
@@ -117,6 +177,7 @@ def pass_fuse_view_chains(ctx: OptimizerContext) -> bool:
             as_strided_inputs = [input_tensor] + list(as_strided_args[1:])
             as_strided_result = fused_node.target(*as_strided_inputs)
             fill_propagated_tensor_metadata_to_node(as_strided_result, fused_node)
+            _fused_view_provenance(chain, fused_node)
 
         leaf_node.replace_all_uses_with(fused_node)
         for node in reversed(chain):
