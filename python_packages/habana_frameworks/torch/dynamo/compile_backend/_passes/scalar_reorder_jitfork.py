@@ -17,7 +17,7 @@ from habana_frameworks.torch.dynamo.debug_utils.logger import get_compile_backen
 
 import torch
 
-from .utils import OptimizerContext
+from .utils import OptimizerContext, copy_provenance_meta
 
 logger = get_compile_backend_logger()
 
@@ -38,6 +38,10 @@ def handling_order_independent_ops(ctx: OptimizerContext, node: torch.fx.Node) -
             new_args,
             node.kwargs,
         )
+        # Swapping the operands does not change which source expression produced
+        # the node, so the replacement inherits the node's provenance -- above all
+        # its stack_trace, without which the source line is lost.
+        copy_provenance_meta(node, new_node)
     return new_node
 
 
@@ -61,6 +65,13 @@ def handling_div_ops(ctx: OptimizerContext, node: torch.fx.Node) -> torch.fx.Nod
             new_args,
             node.kwargs,
         )
+        # Both nodes are part of the same source expression as the div they
+        # replace, so both get its provenance.  ``reciprocal`` has no predecessor
+        # to inherit from -- it is new work introduced by this rewrite -- and
+        # leaving it untraced would make it the one node in the recipe that
+        # cannot be attributed.
+        copy_provenance_meta(node, tensor_reciprocal)
+        copy_provenance_meta(node, new_node)
     return new_node
 
 
@@ -84,6 +95,10 @@ def handling_sub_ops(ctx: OptimizerContext, node: torch.fx.Node) -> torch.fx.Nod
             new_args,
             node.kwargs,
         )
+        # See handling_div_ops: same source expression, so same provenance, on
+        # both the introduced ``neg`` and the replacement ``add``.
+        copy_provenance_meta(node, tensor_neg)
+        copy_provenance_meta(node, new_node)
     return new_node
 
 
