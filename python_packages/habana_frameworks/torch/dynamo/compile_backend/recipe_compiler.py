@@ -13,6 +13,7 @@
 # limitations under the License.
 ###############################################################################
 
+import os
 import sys
 
 import habana_frameworks.torch.internal.bridge_config as bc
@@ -171,6 +172,128 @@ def get_input_symbolic(graph_module, inputs):
     return min_max_shapes, has_dynamic_marked_tensors
 
 
+
+# ---------------------------------------------------------------------------
+# Policy B: NO POST-WARMUP COMPILES.   PT_HPU_POSTWARMUP_COMPILE = strict | warn | off
+#
+# Default is strict: a compile after warmup is a hard failure, because it means
+# warmup did not cover a shape that the serving path then needed. That is a
+# configuration bug, and it silently invalidates any latency measurement taken
+# afterwards.
+#
+# The check sits at `graph_compile`, the single pybind entry that performs a real
+# compile. A precompiled-region / disk-cache HIT does not reach it
+# (hpu_habana_cache.h:529: "no graph_compile"), so a warm boot does not
+# false-fire. A dynamo RECOMPILE does reach it, which is intended: a recompile
+# creates new partitions.
+#
+# Phase detection is the same frame test policy A uses, and for the same two
+# reasons: no C++<->Python binding is needed, and it cannot get stuck open. If a
+# marker function is ever renamed the exemption stops applying and the policy
+# fires during warmup -- loud, not silent.
+# ---------------------------------------------------------------------------
+
+#: (filename suffix, function name) pairs that mean "regions are being built".
+# NOTE: the first version of policy B kept a `_WARMUP_MARKERS` tuple here and
+# tested the stack for those frames. It was removed with the frame test itself
+# (see `_WARMUP_DONE` below for why), but the tuple was left behind, unused, and
+# a reader would reasonably have taken it for the policy's marker set. Nothing
+# read it. Dead code that looks load-bearing is worse than no code.
+
+def _postwarmup_policy() -> str:
+    v = os.environ.get("PT_HPU_POSTWARMUP_COMPILE", "strict").strip().lower()
+    if v in ("", "strict"):
+        return "strict"
+    if v in ("warn", "census", "1", "true"):
+        return "warn"
+    if v in ("off", "0", "false"):
+        return "off"
+    # Fail closed: an unrecognised value must not be a way to disable the policy.
+    return "strict"
+
+
+#: Set once, by ``mark_warmup_done()``, when engine initialisation has finished.
+#:
+#: WHY A POSITIVE MARKER AND NOT A FRAME TEST. A compile legitimately happens
+#: long before warmup: model construction (`HPUModelRunner.__init__`), weight
+#: loading, and `initialize_from_config` all build regions. The first version of
+#: this check tested for a warmup FRAME and therefore fired on
+#: `device_regions:_zeros` during construction -- correct about the compile,
+#: wrong about the phase. Enumerating every init frame would be fragile.
+#:
+#: So the phase is defined by one positive event: warmup finished. That covers
+#: construction, loading and warmup as one "build" phase, which is what the
+#: policy actually means by "before startup".
+#:
+#: The trade is fail-open: if nothing ever calls mark_warmup_done(), the policy
+#: never fires. That is why setting it logs `guard ARMED` -- a boot that never
+#: prints that line has an unarmed guard, and that is visible rather than silent.
+_WARMUP_DONE = False
+
+
+def mark_warmup_done() -> None:
+    """Declare engine initialisation finished: from here on, compiles are a fault.
+
+    Called by ``hpu_worker.compile_or_warm_up_model`` at its end, which is the
+    last step before the engine is ready to serve.
+    """
+    global _WARMUP_DONE
+    if _WARMUP_DONE:
+        return
+    _WARMUP_DONE = True
+    sys.stderr.write(
+        "[postwarmup-compile] guard ARMED: engine initialisation finished. "
+        "Any compile from here on is a policy-B violation "
+        f"(PT_HPU_POSTWARMUP_COMPILE={_postwarmup_policy()}).\n")
+    sys.stderr.flush()
+
+
+def in_warmup_phase() -> bool:
+    """True while engine initialisation is still running."""
+    return not _WARMUP_DONE
+
+
+def _region_hint() -> str:
+    """The region name and source line being compiled, if the ledger knows them.
+
+    This is what makes the warning a *line-numbered* warning: the declared
+    identity comes from ``Region.__call__`` and carries the region's real source
+    position.
+    """
+    try:
+        from . import launch_ledger as _ll
+        getter = getattr(_ll, "_declared_stack", None)
+        stack = getter() if getter is not None else None
+        if stack:
+            name, file, line = stack[-1]
+            return f" region={name} source={file}:{line}"
+    except Exception:  # noqa: BLE001 - diagnostics must never break a compile
+        pass
+    return ""
+
+
+def check_postwarmup_compile(graph_name: str) -> None:
+    """Enforce policy B for one compile."""
+    policy = _postwarmup_policy()
+    if policy == "off" or in_warmup_phase():
+        return
+    where = _region_hint()
+    msg = f"[postwarmup-compile] a compile happened AFTER warmup: graph={graph_name}{where}"
+    if policy == "strict":
+        sys.stderr.write(
+            msg + "\n"
+            "  PT_HPU_POSTWARMUP_COMPILE=strict (the default): a compile after warmup\n"
+            "  means warmup did not cover a shape the serving path then needed. This is\n"
+            "  a controlled exit (status 70), not a crash.\n"
+            "  to collect these as warnings with line numbers instead, re-run with:\n"
+            "    PT_HPU_POSTWARMUP_COMPILE=warn\n")
+        sys.stderr.flush()
+        os._exit(70)
+    sys.stderr.write(msg + "  [warn only, policy B downgraded]\n")
+    sys.stderr.flush()
+
+
+
 class HabanaGraphModule(torch.nn.Module):
     def __init__(
         self,
@@ -320,6 +443,9 @@ class HabanaGraphModule(torch.nn.Module):
                 inputs = (None, None) + inputs
                 if len(is_reusable) > 0:
                     is_reusable = (False, False) + is_reusable
+
+            # Policy B: crash by default if this compile happens after warmup.
+            check_postwarmup_compile(self._name)
 
             self._recipe_id = graph_compile(
                 graph=self._jit_ir,

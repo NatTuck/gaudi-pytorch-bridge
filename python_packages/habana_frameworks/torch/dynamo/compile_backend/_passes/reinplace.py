@@ -208,6 +208,11 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> bool:
     input args, so instead of checking mutation on placeholder, AOTInductor
     checks mutation on get_attr. This is subject to change in future.
     """
+#
+# Modified here. The original licence is Apache-2.0; the changes in this file are
+# Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is recorded rather
+# than hidden, as AGENTS.md requires.
+
 
     inplaceable_ops = construct_inplaceable_ops()
     graph_changed = False
@@ -385,7 +390,20 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> bool:
     # Epilogue: remove copy_ nodes that are used for input mutation but no
     # longer needed after reinplace
     for copy_node in copy_nodes.values():
-        if copy_node not in replace_dict and nodes_to_storage[copy_node.args[0]] == nodes_to_storage[copy_node.args[1]]:
+        # A copy_ whose dst or src argument is a literal None -- aot_autograd's
+        # functional representation of an input mutation leaves the mutated
+        # argument as None -- has no storage to compare. Reading it through the
+        # defaultdict inserts a key and raises KeyError: None, which takes the
+        # whole compile down; read it without inserting instead. A None storage
+        # is not a match, so the node is kept.
+        _dst_storage = nodes_to_storage.get(copy_node.args[0])
+        _src_storage = nodes_to_storage.get(copy_node.args[1])
+        if (
+            copy_node not in replace_dict
+            and _dst_storage is not None
+            and _src_storage is not None
+            and _dst_storage == _src_storage
+        ):
             copy_node.replace_all_uses_with(copy_node.args[0])
             graph.erase_node(copy_node)
 
