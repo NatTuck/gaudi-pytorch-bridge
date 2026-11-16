@@ -346,6 +346,7 @@ inline Site python_site(int skip = 0, int depth = 0) {
         Py_DECREF(walk);
         Py_DECREF(frame);
         site = candidate;
+        site.ok = true;
         site.walked = true;
         site.torch_file = first_file;
         site.torch_func = first_func;
@@ -362,15 +363,18 @@ inline Site python_site(int skip = 0, int depth = 0) {
       Py_DECREF(walk);
     }
     // Ran out of frames (or depth) while still inside torch: keep the torch
-    // frame as the site, and say how far the walk went.
-    site.walked = true;
-    site.torch_file = first_file;
-    site.torch_func = first_func;
-    site.torch_line = first_line;
-    site.depth_used = steps;
-    site.file = first_file;
-    site.func = first_func;
-    site.line = first_line;
+    // frame as the site, and say how far the walk went. If the walk never moved
+    // (no back frame at all) there is nothing to report beyond the torch frame.
+    if (steps > 0) {
+      site.walked = true;
+      site.torch_file = first_file;
+      site.torch_func = first_func;
+      site.torch_line = first_line;
+      site.depth_used = steps;
+      site.file = first_file;
+      site.func = first_func;
+      site.line = first_line;
+    }
   }
 
   Py_DECREF(frame);
