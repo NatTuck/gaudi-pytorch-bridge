@@ -1,4 +1,9 @@
 ###############################################################################
+#
+# Modified here: the provenance fix merged from gaudi2-profiling-identity
+# (copy_provenance_meta at the node-minting sites).
+# Licence: Apache-2.0 (above) AND Copyright Nat Tuck under the GNU AGPL-3.0-only;
+# the conflict is recorded, not hidden.
 # Copyright (c) 2021-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
