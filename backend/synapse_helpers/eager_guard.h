@@ -20,12 +20,40 @@
 // Eager launch guard: make an eager launch name its own Python source, and make
 // it impossible to do quietly.
 //
-//   PT_HPU_EAGER_GUARD = off | census | strict      (default off)
+//   PT_HPU_EAGER_GUARD = off | census | strict      (default strict)
+//   PT_HPU_EAGER_GUARD_DEPTH = N                    (default 0)
 //
 //     off     no behaviour change: one cached load and a not-taken branch.
 //     census  print the Python source of the calling frame, then continue. One
 //             boot yields the complete list of eager sites.
 //     strict  print the same, then exit non-zero with a diagnostic.
+//
+// DEPTH, AND WHY IT EXISTS
+// ------------------------
+// A large class of eager launches is reported at a frame inside torch itself:
+// `torch/utils/_device.py:122` in `DeviceContext.__torch_function__`,
+// `torch/_tensor.py:1120` in `Tensor.__rdiv__`, `torch/nn/init.py:83` in
+// `_no_grad_normal_`. Those frames are torch's own dispatch wrappers. The launch
+// is real and the site is real, but the *caller* we could edit is one or more
+// frames further up, and the guard's default report hides it. An agent cannot
+// fix what it cannot locate.
+//
+// PT_HPU_EAGER_GUARD_DEPTH=N walks up to N frames back past frames whose
+// co_filename is under a `torch/` directory and reports the first frame that is
+// not torch's. The torch frame is kept, as a parenthetical, so nothing is lost.
+//
+// Default 0 preserves the previous behaviour exactly: no walk, the frame is
+// reported as-is. The walk changes only WHICH FRAME IS REPORTED. It never
+// changes whether a launch is refused: strict stays strict, and an eager launch
+// with depth set is still a controlled exit. A launch that walks past every
+// frame it has still refuses; it just says so.
+//
+// The depth is read with plain getenv rather than through the fork's generated
+// env-flag machinery. The generated headers are produced by scripts/generate_env.py
+// from scripts/env_flags.yaml and require a cmake re-run to regenerate; adding a
+// flag there would make this a build-system change for a diagnostic knob. The
+// flag is read once into a function-local static, so the cost is one getenv per
+// process.
 //
 // WHERE, AND WHY NOT ONE FRAME LATER
 // ----------------------------------
@@ -155,6 +183,50 @@ inline Mode parse_mode() {
   return Mode::strict;
 }
 
+// How many torch-internal frames to walk past when reporting a site.
+//
+// DEFAULT 0 = today's behaviour exactly: report the frame that made the C++
+// call, even when that frame is torch's own dispatch wrapper.
+//
+// Read with plain getenv on purpose: this variable is a diagnostic knob for the
+// guard alone, and adding it to scripts/env_flags.yaml would regenerate the
+// whole env-flag machinery (a cmake re-run plus a rebuilt Bindings.cpp) for a
+// number nothing else reads. It never changes WHETHER a launch is refused --
+// only which frame is named in the report.
+inline int parse_depth() {
+  const char* v = std::getenv("PT_HPU_EAGER_GUARD_DEPTH");
+  if (v == nullptr || *v == '\0') {
+    return 0;
+  }
+  const long n = std::strtol(v, nullptr, 10);
+  if (n <= 0) {
+    return 0;
+  }
+  // A walk this deep is a diagnostic, not a hot path; cap it so a typo cannot
+  // turn one eager launch into a long stack walk.
+  constexpr long kMaxDepth = 64;
+  return static_cast<int>(n > kMaxDepth ? kMaxDepth : n);
+}
+
+// True when the frame's file lives under a torch/ directory -- either the venv's
+// site-packages/torch/ or a source checkout's torch/. A wrapper in torch/ is
+// the frame that hid the caller, so the walk steps past it.
+inline bool is_torch_frame(const std::string& file) {
+  if (file.empty()) {
+    return false;
+  }
+  // Match "torch/" as a whole path component, so a file named "mytorch/x.py"
+  // does not count.
+  const std::string needle = "torch/";
+  for (size_t pos = file.find(needle); pos != std::string::npos;
+       pos = file.find(needle, pos + 1)) {
+    if (pos == 0 || file[pos - 1] == '/') {
+      return true;
+    }
+  }
+  return false;
+}
+
 inline std::string unicode_utf8(PyObject* o) {
   if (o == nullptr) {
     return std::string();
@@ -170,6 +242,11 @@ inline Mode mode() {
   return m;
 }
 
+inline int depth() {
+  static const int d = detail::parse_depth();
+  return d;
+}
+
 // The hot-path predicate. When off: a load of a function-local static and a
 // not-taken branch.
 inline bool active() {
@@ -183,11 +260,47 @@ struct Site {
   std::string func;
   int line = 0;
   std::string why; // set when !ok
+
+  // Set when the depth walk moved past one or more torch frames. The reported
+  // site above is then the first non-torch frame; these keep the torch frame
+  // that was actually reported before the walk, so nothing is lost.
+  bool walked = false;
+  std::string torch_file;
+  std::string torch_func;
+  int torch_line = 0;
+  int depth_used = 0;
 };
+
+namespace detail {
+
+inline bool read_frame(PyFrameObject* frame, Site& site) {
+  PyCodeObject* code = PyFrame_GetCode(frame); // new ref
+  site.line = PyFrame_GetLineNumber(frame);
+  if (code != nullptr) {
+    site.file = unicode_utf8(code->co_filename);
+    site.func = unicode_utf8(code->co_name);
+#if PY_VERSION_HEX >= 0x030b0000
+    // co_qualname distinguishes Class.method from a bare method name; it has
+    // existed since 3.11 and is what makes two sites in one file tell apart.
+    const std::string qual = unicode_utf8(code->co_qualname);
+    if (!qual.empty()) {
+      site.func = qual;
+    }
+#endif
+    Py_DECREF(code);
+  }
+  return true;
+}
+
+} // namespace detail
 
 // The Python frame of the caller. `skip` frames are walked back from the
 // current one; skip = 0 is the Python function that made the C++ call.
-inline Site python_site(int skip = 0) {
+//
+// With depth > 0 and the reported frame inside torch, the walk continues past
+// torch frames up to `depth` frames and reports the first frame that is not
+// torch's. The torch frame is preserved in the Site so the message can name it.
+inline Site python_site(int skip = 0, int depth = 0) {
   Site site;
   if (!Py_IsInitialized()) {
     site.why = "the Python interpreter is not initialised";
@@ -213,21 +326,53 @@ inline Site python_site(int skip = 0) {
     PyGILState_Release(gil);
     return site;
   }
-  PyCodeObject* code = PyFrame_GetCode(frame); // new ref
-  site.line = PyFrame_GetLineNumber(frame);
-  if (code != nullptr) {
-    site.file = detail::unicode_utf8(code->co_filename);
-    site.func = detail::unicode_utf8(code->co_name);
-#if PY_VERSION_HEX >= 0x030b0000
-    // co_qualname distinguishes Class.method from a bare method name; it has
-    // existed since 3.11 and is what makes two sites in one file tell apart.
-    const std::string qual = detail::unicode_utf8(code->co_qualname);
-    if (!qual.empty()) {
-      site.func = qual;
+  detail::read_frame(frame, site);
+
+  // The depth walk. Only moves the report up the stack; never changes whether a
+  // launch is refused. A walk that runs out of frames leaves the torch frame as
+  // the reported site and records how far it got, so the caller can see that our
+  // code was not found rather than being told nothing.
+  if (depth > 0 && detail::is_torch_frame(site.file)) {
+    const std::string first_file = site.file;
+    const std::string first_func = site.func;
+    const int first_line = site.line;
+    PyFrameObject* walk = PyFrame_GetBack(frame); // new ref
+    int steps = 0;
+    while (walk != nullptr && steps < depth) {
+      Site candidate;
+      detail::read_frame(walk, candidate);
+      ++steps;
+      if (!detail::is_torch_frame(candidate.file)) {
+        Py_DECREF(walk);
+        Py_DECREF(frame);
+        site = candidate;
+        site.walked = true;
+        site.torch_file = first_file;
+        site.torch_func = first_func;
+        site.torch_line = first_line;
+        site.depth_used = steps;
+        PyGILState_Release(gil);
+        return site;
+      }
+      PyFrameObject* back = PyFrame_GetBack(walk); // new ref
+      Py_DECREF(walk);
+      walk = back;
     }
-#endif
-    Py_DECREF(code);
+    if (walk != nullptr) {
+      Py_DECREF(walk);
+    }
+    // Ran out of frames (or depth) while still inside torch: keep the torch
+    // frame as the site, and say how far the walk went.
+    site.walked = true;
+    site.torch_file = first_file;
+    site.torch_func = first_func;
+    site.torch_line = first_line;
+    site.depth_used = steps;
+    site.file = first_file;
+    site.func = first_func;
+    site.line = first_line;
   }
+
   Py_DECREF(frame);
   PyGILState_Release(gil);
   site.ok = true;
@@ -307,6 +452,8 @@ inline std::string prefix() {
 }
 
 // op=... site=... shapes=... -- one line, greppable, aggregable by sort|uniq -c.
+// When the depth walk moved the report, the real caller is the headline and the
+// torch frame it was reported at is a parenthetical, so both survive.
 inline std::string site_line(
     const char* op,
     const char* op_name,
@@ -324,6 +471,19 @@ inline std::string site_line(
     s += std::to_string(site.line);
     s += " in ";
     s += site.func;
+    if (site.walked) {
+      s += " (torch frame: ";
+      s += site.torch_file;
+      s += ':';
+      s += std::to_string(site.torch_line);
+      s += " in ";
+      s += site.torch_func;
+      s += "; walked ";
+      s += std::to_string(site.depth_used);
+      s += " frame";
+      s += (site.depth_used == 1 ? "" : "s");
+      s += ")";
+    }
   } else {
     s += " site=<unavailable: ";
     s += site.why;
@@ -356,6 +516,19 @@ inline std::string site_line(
     d += std::to_string(site.line);
     d += " in ";
     d += site.func;
+    if (site.walked) {
+      d += "\n[eager-guard]   torch  : ";
+      d += site.torch_file;
+      d += ':';
+      d += std::to_string(site.torch_line);
+      d += " in ";
+      d += site.torch_func;
+      d += " (walked ";
+      d += std::to_string(site.depth_used);
+      d += " frame";
+      d += (site.depth_used == 1 ? "" : "s");
+      d += " past torch)";
+    }
   } else {
     d += "<no Python frame: ";
     d += site.why;
@@ -373,7 +546,9 @@ inline std::string site_line(
        "first, re-run with:\n"
        "[eager-guard]     PT_HPU_EAGER_GUARD=census\n"
        "[eager-guard]   and, to keep those lines out of the boot log:\n"
-       "[eager-guard]     PT_HPU_EAGER_GUARD_LOG=/path/to/eager-guard.log\n";
+       "[eager-guard]     PT_HPU_EAGER_GUARD_LOG=/path/to/eager-guard.log\n"
+       "[eager-guard]   to report the real caller past torch's own frames:\n"
+       "[eager-guard]     PT_HPU_EAGER_GUARD_DEPTH=8\n";
   emit(d);
   std::fflush(nullptr);
   std::_Exit(kStrictExitCode);
@@ -389,7 +564,7 @@ inline bool on_eager_dispatch(const char* op, const char* op_name, ShapesFn&& sh
   if (!active()) {
     return false;
   }
-  const Site site = python_site();
+  const Site site = python_site(0, depth());
   const std::string line = detail::site_line(op, op_name, site, shapes());
   if (mode() == Mode::strict) {
     detail::strict_exit(line, op, site);
