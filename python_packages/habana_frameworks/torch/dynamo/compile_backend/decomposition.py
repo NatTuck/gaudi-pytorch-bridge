@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified here. The original licence above is Apache-2.0; the changes in this
+# file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+# recorded rather than hidden, as AGENTS.md requires.
 ###############################################################################
 
 from contextlib import contextmanager
@@ -536,6 +540,52 @@ def randngen(
         pin_memory=pin_memory,
     ).expand(size)
     return torch.normal(mean, stddev, generator=generator)
+
+
+# aten.normal_functional is the out-of-place normal draw that `torch.randn` and
+# `nn.init.normal_` lower to. It has no HPU kernel: its only HPU-side
+# registration is under the AutocastHPU dispatch key, and its `HPU` dispatch
+# entry is the CompositeExplicitAutograd composite, shared with every other
+# backend. In eager it therefore runs by decomposing into `normal_` + `copy_`,
+# both of which do have HPU kernels; but inside a compiled region the node
+# survives as `aten::normal_functional`, reaches HabanaLaunchOpPT, and dies at
+#     HABANA_ASSERT(HabanaKernelPtr, op, " isn't registered in KernelRegistry!")
+# (hpu_habana_launch_op_tp.cpp:3179). It was also eager-fallbacked, because
+# `scripts/hpu_op.yaml` declares `normal_` and the `normal.*` family but not
+# `normal_functional` (grep -c normal_functional scripts/hpu_op.yaml == 0), so
+# shared-layer validation returned false.
+#
+# Decomposing it here removes it before partitioning, so it is neither eager nor
+# clustered. `aten.normal.float_float` is the functional spelling of the same
+# draw and has both an HPU kernel (`NormalBE`, guid `normal_float_float`) and a
+# shared-layer validator (`NormalSharedMeta`), both already bound in
+# hpu_op.yaml. Same idiom as the `aten.randn.generator` decomposition above.
+#
+# The in-place spelling (`out.normal_(...)`) must NOT be used: AOT Autograd
+# rejects it with "expected to have an entirely functional graph, but found
+# %normal_".
+#
+# Measured with the backend's own compiler on a real traced graph: 0 eager
+# nodes at [2304,1152] and [6,5120], clean run, `self` not mutated, output does
+# not alias `self`. See analysis/zero-eager/normal-functional-fix.md.
+@register_custom_decomposition(aten.normal_functional.default, hpu_backend_decompositions_common)
+def normal_functional(
+    self,
+    mean: float = 0.0,
+    std: float = 1.0,
+    *,
+    generator=None,
+):
+    return torch.ops.aten.normal.float_float(
+        mean,
+        std,
+        list(self.shape),
+        generator=generator,
+        dtype=self.dtype,
+        layout=self.layout,
+        device=self.device,
+        pin_memory=None,
+    )
 
 
 @torch.ops.hpu.mixture_of_experts.default.py_impl(DispatchKey.Autograd)
