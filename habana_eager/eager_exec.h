@@ -141,6 +141,12 @@ struct EagerOpMetaData {
   size_t num_out_tensors_ = 0;
   bool skip_lowering_ = false;
   size_t debug_id_ = habana::profile::RecipeRegistry::invalidId();
+  // Set when PT_HPU_EAGER_GUARD reported this op at the dispatch point
+  // (EagerOpBase::run). It travels with the metadata across the lowering
+  // hand-off, so EagerExec::launch can tell "already reported with a Python
+  // frame" from "arrived here with no dispatch site" and say so instead of
+  // staying silent. See backend/synapse_helpers/eager_guard.h.
+  bool guard_reported_ = false;
 };
 
 /**

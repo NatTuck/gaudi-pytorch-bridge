@@ -17,6 +17,7 @@
 #include <torch/csrc/jit/ir/ir.h>
 #include "backend/habana_device/hpu_cached_devices.h"
 #include "backend/profiling/profiling.h"
+#include "backend/synapse_helpers/eager_guard.h"
 #include "backend/synapse_helpers/env_flags.h"
 #include "habana_eager/eager_context.h"
 #include "pytorch_helpers/habana_helpers/python_utils.h"
@@ -100,6 +101,19 @@ void EagerOpBase::validate_inputs(
 std::mutex EagerOpBase::m_mutex;
 
 void EagerOpBase::run(OutputSpecsOrTensors&& out_spec_or_tensors) {
+  // The eager dispatch point, and the last point on the eager path that still
+  // has a Python frame: this runs on the Python thread with the GIL held, and
+  // the launch it is about to schedule does not. PT_HPU_EAGER_GUARD is a cached
+  // load and a not-taken branch when off; see
+  // backend/synapse_helpers/eager_guard.h for why the guard cannot live one
+  // frame later, at EagerExec::launch.
+  m_eager_op_meta_data.guard_reported_ = habana::eager_guard::on_eager_dispatch(
+      m_symbol.toQualString(),
+      m_eager_op_meta_data.op_name_.c_str(),
+      [this] {
+        return habana::eager_guard::format_shapes(m_inputs);
+      });
+
   m_eager_op_meta_data.debug_id_ = habana::profile::bridge::get_debug_index();
   PT_BRIDGE_BEGIN_WITH_INDEX(m_eager_op_meta_data.debug_id_);
   std::optional<std::vector<at::Tensor>> allocated_outputs =

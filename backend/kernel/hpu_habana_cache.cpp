@@ -35,6 +35,7 @@
 #include "backend/profiling/trace_sources/bridge_logs_source.h"
 #include "backend/synapse_helpers/devmem_logger.h"
 #include "backend/synapse_helpers/launch_ledger.h"
+#include "backend/synapse_helpers/region_identity_registry.h"
 #include "common/utils.h"
 #include "common/warning_suppress.h"
 #include "habana_helpers/logging.h"
@@ -497,6 +498,18 @@ void RecipeHolder::Serialize(std::ostream& os) const {
   rl_->Serialize(os);
 }
 
+void RecipeLauncher::ResolveRegionIdentity() const {
+  if (!region_name_.empty()) {
+    return;
+  }
+  habana::region_identity::Entry e;
+  if (habana::region_identity::lookup(graph_name_, e)) {
+    region_name_ = e.name;
+    region_source_ = e.source;
+    region_index_ = e.index;
+  }
+}
+
 void RecipeLauncher::Serialize(std::ostream& os) const {
   using namespace serialization;
   serialize(os, recipe_ != nullptr);
@@ -506,6 +519,21 @@ void RecipeLauncher::Serialize(std::ostream& os) const {
   }
   serialize(os, workspace_size_);
   serialize(os, ntensorbytes_);
+  // Clause 3. Written here, into the same `.metadata` stream that carries the
+  // serialised RecipeValueSpec, so the identity is a field of the artifact.
+  // Resolved at write time (not at construction) because the RecipeLauncher can
+  // be built before the Python compile path registers the region.
+  ResolveRegionIdentity();
+  serialize(os, region_name_);
+  serialize(os, region_source_);
+  serialize(os, region_index_);
+  // A plain trailing line as well, so the cache is inspectable with grep:
+  // "which source line produced this recipe" is answerable of any entry, cold
+  // or warm, without a parser and without the process that wrote it.
+  if (!region_name_.empty()) {
+    os << "\n[region-identity] name=" << region_name_ << " source="
+       << region_source_ << " index=" << region_index_ << "\n";
+  }
 }
 
 void RecipeValueSpec::Serialize(std::ostream& os) const {
@@ -1625,6 +1653,19 @@ RecipeLauncher::RecipeLauncher(
   }
   deserialize(is, workspace_size_);
   deserialize(is, ntensorbytes_);
+  // Clause 3: the region identity came from the cache entry, not from a counter
+  // in this process. This is the read half that makes a warm boot resolvable.
+  // Guarded on stream state so that an entry written before these fields
+  // existed still loads (with an empty identity) instead of reading garbage.
+  if (is.good()) {
+    deserialize(is, region_name_);
+  }
+  if (is.good()) {
+    deserialize(is, region_source_);
+  }
+  if (is.good()) {
+    deserialize(is, region_index_);
+  }
 }
 
 void RecipeLauncher::Launch(

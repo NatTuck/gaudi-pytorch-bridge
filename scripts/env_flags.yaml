@@ -973,3 +973,26 @@ PT_HPU_ENABLE_FUSED_SDPA_SINK:
   default: true
   settable: true
   doc: "This flag enables attention sink feature in FusedSDPA"
+
+PT_HPU_EAGER_GUARD:
+  default: "off"
+  settable: true
+  constraints:
+    type: enum
+    value: off | census | strict
+  doc: "Eager launch guard, applied at the eager dispatch point
+        (habana::eager::EagerOpBase::run), which is the last point on the eager
+        path that still has a Python frame:
+          off    - no behaviour change; a cached load and a not-taken branch.
+          census - print the Python source (file:line and function) of the
+                   calling frame for every eager launch, then continue. One boot
+                   yields the complete list of eager sites.
+          strict - print the same, then exit non-zero with a diagnostic.
+        Both active modes also report an eager launch that reaches
+        EagerExec::launch without a dispatch site, instead of staying silent."
+
+PT_HPU_EAGER_GUARD_LOG:
+  default: ""
+  doc: "Optional file that PT_HPU_EAGER_GUARD output is appended to. Empty means
+        stderr. A file keeps the guard's lines out of the boot log being
+        measured."

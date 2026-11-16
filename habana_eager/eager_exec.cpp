@@ -27,6 +27,7 @@
 #include "backend/jit_graph_cache.h"
 #include "backend/kernel/hpu_habana_launch_op_pt.h"
 #include "backend/scalar_cache.h"
+#include "backend/synapse_helpers/eager_guard.h"
 #include "habana_eager/eager_tensor.h"
 #include "habana_eager/eager_view.h"
 #include "jit_fork/ir/ir.h"
@@ -346,6 +347,17 @@ void EagerExec::launch() {
   if (check_and_skip_lowering()) {
     PT_EAGER_DEBUG("Eager Op :", m_symbol.toQualString(), " Skip lowering ! ");
     return;
+  }
+
+  // Safety net for the guard: EagerOpBase::run already reported this op with a
+  // Python frame. If it did not, this launch took a path that bypasses the
+  // dispatch point, and a census with a silent hole there is worse than one
+  // that says so. Off when PT_HPU_EAGER_GUARD is off.
+  if (!m_eager_op_meta_data.guard_reported_) {
+    habana::eager_guard::on_launch_without_site(
+        m_symbol.toQualString(), [this] {
+          return habana::eager_guard::format_shapes(m_inputs);
+        });
   }
 
   // stack is used for both inputs to synapse lowering and outputs from

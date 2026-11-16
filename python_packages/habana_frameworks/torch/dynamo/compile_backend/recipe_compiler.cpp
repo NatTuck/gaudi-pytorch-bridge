@@ -24,6 +24,7 @@
 #include "backend/habana_device/HPUAllocator.h"
 #include "backend/helpers/tensor_utils.h"
 #include "habana_eager/graph_storage.h"
+#include "backend/synapse_helpers/region_identity_registry.h"
 
 #include "habana_helpers/logging.h"
 namespace {
@@ -249,4 +250,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "calculate_symval_hashcode",
       &calculate_symval_hashcode,
       "Calculate hash key of graph input tensor shapes and strides");
+  // Clause 3: register the region identity for a graph name before it compiles,
+  // so that `RecipeLauncher::Serialize` can write it into the recipe's
+  // `.metadata` and the identity travels with the recipe into the cache.
+  // Called from compile_backend/launch_ledger.py, which is the only place that
+  // has the FX stack_trace. See backend/synapse_helpers/region_identity_registry.h.
+  m.def(
+      "note_region",
+      [](const std::string& graph_name,
+         const std::string& name,
+         const std::string& source,
+         uint32_t index) {
+        habana::region_identity::note(graph_name, name, source, index);
+      },
+      "Register (graph name -> region name, source file:line, index) so the "
+      "identity is written into the recipe cache entry",
+      py::arg("graph_name"),
+      py::arg("name"),
+      py::arg("source"),
+      py::arg("index"));
+  m.def(
+      "region_identity_count",
+      []() { return habana::region_identity::size(); },
+      "How many region identities this process registered");
 }

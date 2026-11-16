@@ -1,0 +1,381 @@
+/**
+ * Copyright (c) 2021-2026 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Modified here. The original licence above is Apache-2.0; the changes in this
+ * file are Copyright Nat Tuck under the GNU AGPL-3.0-only. The conflict is
+ * recorded rather than hidden, as AGENTS.md requires.
+ */
+
+// Eager launch guard: make an eager launch name its own Python source, and make
+// it impossible to do quietly.
+//
+//   PT_HPU_EAGER_GUARD = off | census | strict      (default off)
+//
+//     off     no behaviour change: one cached load and a not-taken branch.
+//     census  print the Python source of the calling frame, then continue. One
+//             boot yields the complete list of eager sites.
+//     strict  print the same, then exit non-zero with a diagnostic.
+//
+// WHERE, AND WHY NOT ONE FRAME LATER
+// ----------------------------------
+// The brief names the chain
+//     EagerExec::launch -> HabanaLaunchOpPT -> RecipeLauncher::Launch
+// and asks for a Python frame. That chain has no Python frame at any link, and
+// the reason is structural rather than incidental:
+//
+//   * With PT_HPU_EAGER_PIPELINE_ENABLE (default true), EagerOpBase::run hands
+//     the launch to EagerLoweringTask on the *lowering thread*. The Python
+//     thread that dispatched the op has already returned to the interpreter.
+//   * With the pipeline disabled, EagerOpBase::run constructs an AutoNoGIL and
+//     calls Acquire() -- releasing the GIL -- *before* hlexec.launch().
+//
+// So the last point on the eager path that still has a Python frame is
+// EagerOpBase::run, which is also the one function every eager op passes
+// through: every EagerOp<>::call() variant funnels into it, and it runs on the
+// Python thread with the GIL held. That is the eager dispatch point, and it is
+// where this guard is called.
+//
+// To keep the instrument honest about what it cannot see, the dispatch records
+// that it fired (EagerOpMetaData::guard_reported_), and EagerExec::launch --
+// the link the brief names -- reports any eager launch that arrives there
+// *without* a dispatch site instead of staying silent. That is the difference
+// between a census with a known denominator and a census that quietly misses
+// rows.
+//
+// THE MECHANISM
+// -------------
+// PyGILState_Ensure + PyThreadState_GetFrame + PyFrame_GetCode. There is no
+// cheaper mechanism that produces a Python frame:
+//   * an FX node's `meta["stack_trace"]` is the right answer for a *compiled*
+//     region and is what Requirement 2 enforces on the Python side, but an
+//     eager op has no FX node and no trace -- there is nothing to read;
+//   * torch's C++ backtrace helpers (c10::get_backtrace) produce a C++ stack,
+//     which is exactly what the brief says is not wanted: it would name
+//     habana_kernels/*.cpp, not the Python line that called the op.
+// The bridge links plain Python C-API (Python 3.12, no Py_LIMITED_API; the
+// python_embed_shim is commented out of pytorch_helpers/CMakeLists.txt), and
+// the TUs that include this header already include Python.h.
+//
+// Header-only on purpose: a new translation unit needs a cmake re-run and this
+// build tree's configure-time variables are in neither the environment nor the
+// cache (analysis/precompiled-region/REPORT.md section 8).
+
+#pragma once
+
+#include <Python.h>
+
+#include <ATen/ATen.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "backend/synapse_helpers/env_flags.h"
+
+namespace habana::eager_guard {
+
+// Exit status for strict mode. 70 is EX_SOFTWARE in sysexits.h: the process
+// stopped because the code refused to continue, not because it crashed.
+constexpr int kStrictExitCode = 70;
+
+enum class Mode : int { off = 0, census = 1, strict = 2 };
+
+namespace detail {
+
+// Read once, through the fork's own env-flag machinery so that the value is
+// validated by the constraint declared in scripts/env_flags.yaml and is visible
+// to `habana_frameworks.torch.internal.bridge_config`.
+inline Mode parse_mode() {
+  const char* v = GET_ENV_FLAG_NEW(PT_HPU_EAGER_GUARD);
+  if (v == nullptr || *v == '\0' || std::strcmp(v, "off") == 0) {
+    return Mode::off;
+  }
+  if (std::strcmp(v, "census") == 0) {
+    return Mode::census;
+  }
+  if (std::strcmp(v, "strict") == 0) {
+    return Mode::strict;
+  }
+  // The enum constraint in env_flags.yaml rejects anything else, so reaching
+  // here means the constraint was bypassed (SET_ENV_FLAG_NEW). Fail towards
+  // silence rather than towards aborting a boot for a typo.
+  return Mode::off;
+}
+
+inline std::string unicode_utf8(PyObject* o) {
+  if (o == nullptr) {
+    return std::string();
+  }
+  const char* s = PyUnicode_AsUTF8(o);
+  return s != nullptr ? std::string(s) : std::string();
+}
+
+} // namespace detail
+
+inline Mode mode() {
+  static const Mode m = detail::parse_mode();
+  return m;
+}
+
+// The hot-path predicate. When off: a load of a function-local static and a
+// not-taken branch.
+inline bool active() {
+  static const bool a = mode() != Mode::off;
+  return a;
+}
+
+struct Site {
+  bool ok = false;
+  std::string file;
+  std::string func;
+  int line = 0;
+  std::string why; // set when !ok
+};
+
+// The Python frame of the caller. `skip` frames are walked back from the
+// current one; skip = 0 is the Python function that made the C++ call.
+inline Site python_site(int skip = 0) {
+  Site site;
+  if (!Py_IsInitialized()) {
+    site.why = "the Python interpreter is not initialised";
+    return site;
+  }
+  // Do not let PyGILState_Ensure invent a thread state for a thread that has
+  // none: an eager op issued from a non-Python thread has no Python caller to
+  // name, and a dummy thread state would report "no frame" as if it were the
+  // op's fault.
+  if (PyGILState_GetThisThreadState() == nullptr) {
+    site.why = "this thread has no Python thread state (not a Python thread)";
+    return site;
+  }
+  const PyGILState_STATE gil = PyGILState_Ensure();
+  PyFrameObject* frame = PyThreadState_GetFrame(PyThreadState_Get()); // new ref
+  for (int i = 0; i < skip && frame != nullptr; ++i) {
+    PyFrameObject* back = PyFrame_GetBack(frame); // new ref
+    Py_DECREF(frame);
+    frame = back;
+  }
+  if (frame == nullptr) {
+    site.why = "no Python frame is executing on this thread";
+    PyGILState_Release(gil);
+    return site;
+  }
+  PyCodeObject* code = PyFrame_GetCode(frame); // new ref
+  site.line = PyFrame_GetLineNumber(frame);
+  if (code != nullptr) {
+    site.file = detail::unicode_utf8(code->co_filename);
+    site.func = detail::unicode_utf8(code->co_name);
+#if PY_VERSION_HEX >= 0x030b0000
+    // co_qualname distinguishes Class.method from a bare method name; it has
+    // existed since 3.11 and is what makes two sites in one file tell apart.
+    const std::string qual = detail::unicode_utf8(code->co_qualname);
+    if (!qual.empty()) {
+      site.func = qual;
+    }
+#endif
+    Py_DECREF(code);
+  }
+  Py_DECREF(frame);
+  PyGILState_Release(gil);
+  site.ok = true;
+  return site;
+}
+
+// Where the guard's output goes: PT_HPU_EAGER_GUARD_LOG if set (keeps the lines
+// out of the boot log being measured), otherwise stderr.
+inline void emit(const std::string& text) {
+  static FILE* out = [] {
+    const char* p = GET_ENV_FLAG_NEW(PT_HPU_EAGER_GUARD_LOG);
+    if (p != nullptr && *p != '\0') {
+      FILE* f = std::fopen(p, "a");
+      if (f != nullptr) {
+        return f;
+      }
+    }
+    return stderr;
+  }();
+  std::fwrite(text.data(), 1, text.size(), out);
+  std::fflush(out);
+}
+
+// Shapes, for the diagnostic. Capped so that one line stays one line.
+inline std::string format_shapes(const std::vector<at::IValue>& inputs) {
+  constexpr size_t kMax = 6;
+  std::string s;
+  s += '[';
+  size_t shown = 0;
+  for (const auto& v : inputs) {
+    if (shown >= kMax) {
+      s += ", ...";
+      break;
+    }
+    if (shown > 0) {
+      s += ", ";
+    }
+    ++shown;
+    if (v.isTensor()) {
+      const auto& t = v.toTensor();
+      if (!t.defined()) {
+        s += "<undefined>";
+        continue;
+      }
+      s += '[';
+      const auto sizes = t.sizes();
+      for (size_t i = 0; i < sizes.size(); ++i) {
+        if (i > 0) {
+          s += ',';
+        }
+        s += std::to_string(sizes[i]);
+      }
+      s += ']';
+      s += at::toString(t.scalar_type());
+    } else if (v.isScalar()) {
+      s += "scalar";
+    } else if (v.isIntList()) {
+      s += "int[]";
+    } else if (v.isDoubleList()) {
+      s += "float[]";
+    } else if (v.isNone()) {
+      s += "None";
+    } else if (v.isBool()) {
+      s += v.toBool() ? "True" : "False";
+    } else {
+      s += v.tagKind();
+    }
+  }
+  s += ']';
+  return s;
+}
+
+namespace detail {
+
+inline std::string prefix() {
+  return mode() == Mode::strict ? "[eager-guard] STRICT " : "[eager-guard] CENSUS ";
+}
+
+// op=... site=... shapes=... -- one line, greppable, aggregable by sort|uniq -c.
+inline std::string site_line(
+    const char* op,
+    const char* op_name,
+    const Site& site,
+    const std::string& shapes) {
+  std::string s;
+  s.reserve(512);
+  s += prefix();
+  s += "op=";
+  s += (op != nullptr && *op != '\0') ? op : "<unnamed>";
+  if (site.ok) {
+    s += " site=";
+    s += site.file;
+    s += ':';
+    s += std::to_string(site.line);
+    s += " in ";
+    s += site.func;
+  } else {
+    s += " site=<unavailable: ";
+    s += site.why;
+    s += ">";
+  }
+  s += " shapes=";
+  s += shapes;
+  if (op_name != nullptr && *op_name != '\0' &&
+      (op == nullptr || std::strcmp(op, op_name) != 0)) {
+    s += " op_name=";
+    s += op_name;
+  }
+  s += '\n';
+  return s;
+}
+
+[[noreturn]] inline void strict_exit(
+    const std::string& line,
+    const char* op,
+    const Site& site) {
+  emit(line);
+  std::string d;
+  d += "[eager-guard] STRICT: refusing to continue past an eager launch.\n";
+  d += "[eager-guard]   op     : ";
+  d += (op != nullptr && *op != '\0') ? op : "<unnamed>";
+  d += "\n[eager-guard]   source : ";
+  if (site.ok) {
+    d += site.file;
+    d += ':';
+    d += std::to_string(site.line);
+    d += " in ";
+    d += site.func;
+  } else {
+    d += "<no Python frame: ";
+    d += site.why;
+    d += ">";
+  }
+  d += "\n[eager-guard]   why    : this launch is outside a compiled region, so it "
+       "mints and\n"
+       "[eager-guard]            re-mints its own recipe instead of reusing one. "
+       "The eager\n"
+       "[eager-guard]            path is not allowed to launch quietly while "
+       "PT_HPU_EAGER_GUARD=strict.\n"
+       "[eager-guard]   this is a controlled exit (status 70), not a crash or a "
+       "segfault.\n"
+       "[eager-guard]   to collect the whole list instead of stopping at the "
+       "first, re-run with:\n"
+       "[eager-guard]     PT_HPU_EAGER_GUARD=census\n"
+       "[eager-guard]   and, to keep those lines out of the boot log:\n"
+       "[eager-guard]     PT_HPU_EAGER_GUARD_LOG=/path/to/eager-guard.log\n";
+  emit(d);
+  std::fflush(nullptr);
+  std::_Exit(kStrictExitCode);
+}
+
+} // namespace detail
+
+// Called at the eager dispatch point, on the Python thread, once per eager op.
+// Returns true when the guard was active, so the caller can record that a
+// dispatch site was reported.
+template <typename ShapesFn>
+inline bool on_eager_dispatch(const char* op, const char* op_name, ShapesFn&& shapes) {
+  if (!active()) {
+    return false;
+  }
+  const Site site = python_site();
+  const std::string line = detail::site_line(op, op_name, site, shapes());
+  if (mode() == Mode::strict) {
+    detail::strict_exit(line, op, site);
+  }
+  emit(line);
+  return true;
+}
+
+// Called from EagerExec::launch when an eager launch arrives without a dispatch
+// site. That is the one thing this instrument must not swallow: it means the
+// launch took a path that bypasses EagerOpBase::run, and the census has a hole
+// exactly there. It is reported, not hidden.
+template <typename ShapesFn>
+inline void on_launch_without_site(const char* op, ShapesFn&& shapes) {
+  if (!active()) {
+    return;
+  }
+  Site site;
+  site.why =
+      "this eager launch reached EagerExec::launch without passing through "
+      "EagerOpBase::run, and EagerExec::launch runs on the lowering thread "
+      "(or with the GIL released), where no Python frame exists";
+  const std::string line = detail::site_line(op, nullptr, site, shapes());
+  if (mode() == Mode::strict) {
+    detail::strict_exit(line, op, site);
+  }
+  emit(line);
+}
+
+} // namespace habana::eager_guard

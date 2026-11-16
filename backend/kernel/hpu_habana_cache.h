@@ -483,6 +483,19 @@ struct RecipeLauncher {
   size_t num_intermediate_to_outduplicates_ = 0;
   size_t num_launches = 0;
   std::string graph_name_;
+  // Clause 3: the region identity, written into the recipe's `.metadata`
+  // stream so that it travels with the recipe into the cache and a warm boot
+  // can resolve the entry back to its region and source line without any
+  // per-process side table. Empty until resolved: `ResolveRegionIdentity()`
+  // fills it from backend/synapse_helpers/region_identity_registry.h, which the
+  // Python compile path populates because it is the only place that has the FX
+  // `stack_trace`. See region_identity_registry.h for why this is a field of
+  // the artifact rather than a row in a side table.
+  mutable std::string region_name_;
+  mutable std::string region_source_;
+  mutable uint32_t region_index_{0};
+  // Fills region_* from the registry, once, keyed by graph_name_.
+  void ResolveRegionIdentity() const;
   std::shared_ptr<habana_helpers::CollectiveKernelInfos>
       collective_kernels_info_;
   size_t debug_id_ = habana::profile::RecipeRegistry::invalidId();
