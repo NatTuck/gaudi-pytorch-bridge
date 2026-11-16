@@ -53,6 +53,41 @@
 // between a census with a known denominator and a census that quietly misses
 // rows.
 //
+// THE ABORT PRECEDES THE COMPILE (why strict means ZERO eager compiles)
+// ---------------------------------------------------------------------
+// The rule is "eager launches should be crashes, not compiles", so the one
+// thing that matters about this hook's position is whether the recipe is
+// already minted when it fires. It is not. The chain, with the file and line of
+// every link:
+//
+//   EagerOpBase::run                  habana_eager/ops/eager_op.cpp:103
+//     -> on_eager_dispatch            eager_op.cpp:110   <-- FIRST STATEMENT
+//        ... strict: std::_Exit(70) here ...
+//     -> ScheduleWorkAndUpdateLoweringThreadHandle(EagerLoweringTask, ...)
+//                                     eager_op.cpp:140   (pipeline on)
+//     or hlexec.launch()              eager_op.cpp:166   (pipeline off)
+//     -> EagerExec::launch            habana_eager/eager_exec.cpp:345
+//        -> on_launch_without_site    eager_exec.cpp:356   (safety net)
+//     -> HabanaLaunchOpPT ctor        eager_exec.cpp:518
+//     -> CompileSynapseGraph()        backend/kernel/
+//                                     hpu_habana_launch_op_pt_lowering.cpp:761
+//                                     (reached from CompileSynapseGraphAndPatch-
+//                                      Table, hpu_habana_launch_op_pt.cpp:6122,
+//                                      6342, 6592, 7011, ...)
+//
+// on_eager_dispatch is the first statement of run(): it runs before the stack is
+// converted, before the lowering task is scheduled, and before hlexec.launch().
+// The compile is five links downstream of it, so in strict mode the process is
+// gone before any code that could mint a recipe runs. A strict boot therefore
+// produces exactly zero eager compiles -- not "few", zero -- and the only
+// recipes it mints are the ones a compiled region asked for.
+//
+// The one caveat, stated rather than hidden: ops dispatched *before* the first
+// eager one have already compiled, and they always will, because an op cannot be
+// known to be eager before it is dispatched. That is why the deliverable is a
+// boot that dies at its first eager dispatch: the compile it prevents is its
+// own, and everything after it.
+//
 // THE MECHANISM
 // -------------
 // PyGILState_Ensure + PyThreadState_GetFrame + PyFrame_GetCode. There is no
@@ -97,21 +132,27 @@ namespace detail {
 // Read once, through the fork's own env-flag machinery so that the value is
 // validated by the constraint declared in scripts/env_flags.yaml and is visible
 // to `habana_frameworks.torch.internal.bridge_config`.
+//
+// DEFAULTS TO strict. An unset or empty PT_HPU_EAGER_GUARD means strict, and so
+// does anything unrecognised: the rule is "eager launches should be crashes, not
+// compiles", and a guard that fails open on a typo is a guard that lets 139 k
+// eager compiles through because someone mistyped a variable name. `off` and
+// `census` are still here, but they have to be asked for by name.
 inline Mode parse_mode() {
   const char* v = GET_ENV_FLAG_NEW(PT_HPU_EAGER_GUARD);
-  if (v == nullptr || *v == '\0' || std::strcmp(v, "off") == 0) {
+  if (v == nullptr || *v == '\0' || std::strcmp(v, "strict") == 0) {
+    return Mode::strict;
+  }
+  if (std::strcmp(v, "off") == 0) {
     return Mode::off;
   }
   if (std::strcmp(v, "census") == 0) {
     return Mode::census;
   }
-  if (std::strcmp(v, "strict") == 0) {
-    return Mode::strict;
-  }
   // The enum constraint in env_flags.yaml rejects anything else, so reaching
-  // here means the constraint was bypassed (SET_ENV_FLAG_NEW). Fail towards
-  // silence rather than towards aborting a boot for a typo.
-  return Mode::off;
+  // here means the constraint was bypassed (SET_ENV_FLAG_NEW). Fail closed:
+  // an unrecognised value must not be a way to turn the guard off.
+  return Mode::strict;
 }
 
 inline std::string unicode_utf8(PyObject* o) {

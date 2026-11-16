@@ -975,19 +975,31 @@ PT_HPU_ENABLE_FUSED_SDPA_SINK:
   doc: "This flag enables attention sink feature in FusedSDPA"
 
 PT_HPU_EAGER_GUARD:
-  default: "off"
+  default: "strict"
   settable: true
   constraints:
     type: enum
     value: off | census | strict
   doc: "Eager launch guard, applied at the eager dispatch point
         (habana::eager::EagerOpBase::run), which is the last point on the eager
-        path that still has a Python frame:
+        path that still has a Python frame.
+
+        DEFAULT IS strict. An unset PT_HPU_EAGER_GUARD means strict: eager
+        launches are crashes, not compiles. Every eager launch mints its own
+        recipe, so 139 682 of a boot's 139 682 compiles were eager in the
+        measured configuration; the guard makes that a controlled exit (status
+        70) before the recipe is minted instead of a silent compile.
+
+          strict - print the Python source of the calling frame, then exit
+                   non-zero with a diagnostic. This is the normal way the stack
+                   runs.
+          census - print the same and continue. A development aid for
+                   enumerating the sites a boot still reaches eagerly. NOT a
+                   supported way to run the model: it pays the eager compiles.
           off    - no behaviour change; a cached load and a not-taken branch.
-          census - print the Python source (file:line and function) of the
-                   calling frame for every eager launch, then continue. One boot
-                   yields the complete list of eager sites.
-          strict - print the same, then exit non-zero with a diagnostic.
+                   Development only, and setting it is how a boot quietly
+                   reintroduces 139 k compiles.
+
         Both active modes also report an eager launch that reaches
         EagerExec::launch without a dispatch site, instead of staying silent."
 
