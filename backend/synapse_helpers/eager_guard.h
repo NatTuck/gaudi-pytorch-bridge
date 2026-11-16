@@ -583,107 +583,67 @@ inline std::string site_line(
 //   B. no post-warmup compile  -- PT_HPU_POSTWARMUP_COMPILE (strict by default)
 // Both can be downgraded to a warning that names file:line.
 //
-// Policy A exempts eager launches issued *while compiled regions are being
-// built*, because that is when a region legitimately traces torch-internal code
-// and an eager op there is construction, not a serving-path defect. Measured:
-// 39 such launches in a full boot, 0 growth across 5 served requests.
+// POLICY A, RE-SCOPED 2026-11-16: the exemption is by ORIGIN, not by phase.
 //
-// WHY FRAME-BASED AND NOT A FLAG. A thread-local "we are in warmup" flag would
-// need a C++<->Python binding (no PYBIND11_MODULE TU includes this header), and
-// worse, a flag that got stuck open would silently turn strict into off for the
-// rest of the process -- the fail-open shape that has already cost this campaign
-// real defects. Reading the actual stack cannot get stuck, and if the marker
-// function is ever renamed the exemption stops applying: strict then aborts
-// during warmup, which is loud and immediately obvious. Fail closed.
+// It used to exempt any eager launch issued *while a warmup frame was on the
+// stack*. That measured the wrong thing: it allowed 7,365 eager launches to
+// accumulate on the DFlash2 arm during initialisation and still be "compliant",
+// because the rule asked "when did this happen?" instead of "whose code is
+// this?".
 //
-// The marker is our own code, not torch's. `torch/_ops.py OpOverload.__call__`
-// was rejected as a discriminator: it fires identically during tracing and at
-// runtime, so it cannot tell the two phases apart.
+// The rule is now: an eager launch is allowed only when PyTorch's own tracing
+// machinery issued it. Everything else -- during warmup as much as after it --
+// is a violation. That is the actual goal, so it is the actual policy, and it is
+// enforced by the default configuration rather than by a report someone reads.
+//
+// WHY THIS LIST IS EXPLICIT AND SHORT. The residue this permits is the
+// fake-tensor/proxy-tensor copies PyTorch makes while it traces a compiled
+// region. Those are enumerated by file, each for a stated reason, rather than
+// matched by a broad pattern such as "the path is under site-packages/torch/".
+// The broad version is wrong in a way that matters: `torch/utils/_device.py`
+// `DeviceContext.__torch_function__` is a torch frame wrapped around *our*
+// `torch.zeros` call, so a path test would exempt 23 launches of our own code
+// while appearing to be a principled rule. Measured on the DFlash2 census.
+//
+// FAIL CLOSED. If a future torch moves one of these files the exemption stops
+// applying and strict aborts loudly during warmup. That is the right direction:
+// a rule that cannot silently widen is worth more than one that never needs
+// maintenance.
+//
+// No stack walk, no thread-local flag, and therefore nothing that can get stuck
+// open -- the failure mode that has already cost this campaign real defects.
 // ---------------------------------------------------------------------------
-
-// How far up the stack to look for a warmup frame. Generous: the frame can be
-// deep (region -> contextmanager -> dummy scenario -> warmup_model -> worker).
-inline int warmup_walk() {
-  return 128;
-}
 
 inline bool ends_with(const std::string& s, const char* suffix) {
   const size_t n = std::strlen(suffix);
   return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
-// A frame that means "compiled regions are being built right now".
-// NOTE ON THE MARKER SET, and why it is the init chain rather than just warmup.
-// The first version listed only the warmup functions, and strict then aborted on
-// a launch issued from `Region.__call__` during MODEL CONSTRUCTION -- correct
-// about the launch, wrong about the phase. A region legitimately first-compiles
-// during construction (site #0's `_zeros`), during weight loading, and during
-// warmup, and all of that is "regions are being built".
-//
-// So the markers are the functions that only ever run while the engine is
-// initialising. Deliberately NOT included: `execute_model`, `sample_tokens`,
-// `_execute_model_generic` and the rest of the serving path -- those are exactly
-// what policy A is for.
-// `Site::func` carries `co_qualname`, not `co_name` (see read_frame: the
-// qualname is what tells two sites in one file apart). For a method that is
-// "Class.method", so a bare marker must be matched against the LAST component.
-//
-// THIS WAS A REAL, SILENT BUG, and it is the reason the first strict boot
-// aborted at a warmup launch with ZERO "EXEMPT-WARMUP" lines: every marker
-// compared against a qualname that could never equal it, so the exemption never
-// applied at all. It failed closed (loud abort), which is the design, but it
-// cost a boot and an earlier wrong diagnosis -- I blamed the marker SET being
-// too narrow and widened it, when the comparison was wrong for every name in it.
-inline std::string bare_name(const std::string& qual) {
-  const size_t dot = qual.rfind('.');
-  return dot == std::string::npos ? qual : qual.substr(dot + 1);
-}
+// PyTorch machinery that legitimately issues eager launches while it traces.
+// Each entry must name a file that exists in the installed torch; that is
+// asserted off-card by tools/torch_internal_allowlist_check.py, so an entry
+// cannot rot into a rule that never matches.
+inline const char* const kTorchInternalFiles[] = {
+    // FakeTensor propagation: the copies torch makes while tracing a region.
+    "torch/_subclasses/fake_tensor.py",
+    // ProxyTensor tracing, same work through the other tracing entry point.
+    "torch/fx/experimental/proxy_tensor.py",
+    // OpOverload.__call__ dispatch during tracing.
+    "torch/_ops.py",
+};
 
-inline bool is_warmup_frame(const Site& s) {
-  if (s.file.empty() || s.func.empty()) {
+// True when the frame that issued this launch is one of PyTorch's own tracing
+// files. NOT a phase test: a violation is a violation during warmup too.
+inline bool is_torch_internal(const Site& s) {
+  if (s.file.empty()) {
     return false;
   }
-  const std::string fn = bare_name(s.func);
-  if (ends_with(s.file, "hpu_worker.py")) {
-    return fn == "__init__" || fn == "load_model" ||
-           fn == "initialize_from_config" ||
-           fn == "compile_or_warm_up_model";
-  }
-  if (ends_with(s.file, "hpu_model_runner.py")) {
-    return fn == "__init__" || fn == "load_model" || fn == "warmup_model" ||
-           fn == "warmup_graphs" || fn == "warmup_sampler" ||
-           fn == "_prepare_dummy_scenario" || fn == "_execute_dummy_scenario";
+  for (const char* f : kTorchInternalFiles) {
+    if (ends_with(s.file, f)) {
+      return true;
+    }
   }
   return false;
-}
-
-// True when a warmup/compile marker frame is on this thread's Python stack.
-inline bool in_warmup_phase() {
-  if (!Py_IsInitialized() || PyGILState_GetThisThreadState() == nullptr) {
-    return false;
-  }
-  const PyGILState_STATE gil = PyGILState_Ensure();
-  bool found = false;
-  PyFrameObject* walk = PyThreadState_GetFrame(PyThreadState_Get()); // new ref
-  int steps = 0;
-  const int limit = warmup_walk();
-  while (walk != nullptr && steps < limit) {
-    Site s;
-    detail::read_frame(walk, s);
-    if (is_warmup_frame(s)) {
-      found = true;
-      break;
-    }
-    PyFrameObject* back = PyFrame_GetBack(walk); // new ref
-    Py_DECREF(walk);
-    walk = back;
-    ++steps;
-  }
-  if (walk != nullptr) {
-    Py_DECREF(walk);
-  }
-  PyGILState_Release(gil);
-  return found;
 }
 
 template <typename ShapesFn>
@@ -694,12 +654,11 @@ inline bool on_eager_dispatch(const char* op, const char* op_name, ShapesFn&& sh
   const Site site = python_site(0, depth());
   const std::string shape_text = shapes();
 
-  // Policy A: no eager user code. Eager launches issued while compiled regions
-  // are being built are exempt -- but they are still RECORDED and LABELLED, so
-  // an exempted launch can never be mistaken for a clean one. Silence is what
-  // let a 2047-of-2048-element corruption through earlier in this campaign.
-  if (in_warmup_phase()) {
-    emit(detail::site_line(op, op_name, site, shape_text, "EXEMPT-WARMUP"));
+  // Policy A: no eager launch from our code, at any phase. Only PyTorch's own
+  // tracing machinery is exempt -- and it is still RECORDED and LABELLED, so an
+  // exempted launch can never be mistaken for a clean one.
+  if (is_torch_internal(site)) {
+    emit(detail::site_line(op, op_name, site, shape_text, "EXEMPT-TORCH"));
     return true;
   }
 
@@ -726,8 +685,11 @@ inline void on_launch_without_site(const char* op, ShapesFn&& shapes) {
       "EagerOpBase::run, and EagerExec::launch runs on the lowering thread "
       "(or with the GIL released), where no Python frame exists";
   const std::string shape_text = shapes();
-  if (in_warmup_phase()) {
-    emit(detail::site_line(op, nullptr, site, shape_text, "EXEMPT-WARMUP"));
+  // No site means no way to prove this came from torch's tracing machinery, so
+  // it is a violation. Fail closed: a launch that bypasses EagerOpBase::run is
+  // exactly the hole this instrument exists to name.
+  if (is_torch_internal(site)) {
+    emit(detail::site_line(op, nullptr, site, shape_text, "EXEMPT-TORCH"));
     return;
   }
   const std::string line = detail::site_line(op, nullptr, site, shape_text);
