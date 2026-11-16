@@ -75,6 +75,91 @@ _ri = None
 _ri_tried = False
 _warned = set()
 
+# ---- Caller-declared region identity --------------------------------------
+#
+# A region's identity is normally derived from its FX nodes' meta['stack_trace'].
+# That works for a model region, whose source position is the only record of
+# where it came from. It does not work for a hand-written region
+# (vllm_gaudi.device_regions.Region), because the ops such a region performs are
+# minted inside torch: aot_autograd's functionalisation represents an input
+# mutation as a fresh `aten.copy_.default` carrying no meta at all, so a region
+# that is a bare `dest.copy_(src)` reaches the seal with zero traced nodes and
+# is refused. The source of such a region is not lost -- it is the module-level
+# function the Region wraps, which has a real `__module__` and `__qualname__`,
+# and Region already computes that string as its name.
+#
+# So Region may *declare* its identity for the duration of its call. This is an
+# explicit opt-in by our own code, not a general fallback: a model region never
+# sets it, so Requirement 2 is unchanged for every region that does not name
+# itself. The declaration is a thread-local stack because compilation is
+# re-entrant (a region's compile may reach another region's call).
+_declared = threading.local()
+
+
+def _declared_stack() -> list:
+    st = getattr(_declared, "stack", None)
+    if st is None:
+        st = _declared.stack = []
+    return st
+
+
+def set_declared_identity(name: str, file: str | None = None, line: int | None = None):
+    """Declare the identity of the region being compiled on this thread.
+
+    Called by ``vllm_gaudi.device_regions.Region`` immediately before it compiles
+    or runs its function. ``file``/``line`` are the wrapped function's own
+    definition site, which is the region's real source position. Returns a token
+    to pass to :func:`clear_declared_identity`.
+    """
+    _declared_stack().append((name, file, line))
+    return _declared_stack()[-1]
+
+
+def clear_declared_identity(token) -> None:
+    """Undo the matching :func:`set_declared_identity`."""
+    st = _declared_stack()
+    if st and st[-1] is token:
+        st.pop()
+        return
+    # Tolerate out-of-order teardown (an exception unwound a nested region).
+    for i in range(len(st) - 1, -1, -1):
+        if st[i] is token:
+            del st[i]
+            return
+
+
+def declared_identity():
+    """The innermost declared identity on this thread, or None."""
+    st = _declared_stack()
+    return st[-1] if st else None
+
+
+def _declared_shape(ri, gm, declared):
+    """A RecipeShape for a region that names itself.
+
+    The region's source position is the wrapped function's definition, not its
+    FX nodes' traces (there are none -- the ops are minted inside torch). Every
+    field is derived from that one position plus the partition's node count, so
+    the shape is as stable as the function's own source, which is exactly what
+    the numbering needs.
+    """
+    name, file, line = declared
+    f = file or "<declared>"
+    ln = int(line) if line and line > 0 else 0
+    func = name.rsplit(":", 1)[-1]
+    return ri.RecipeShape(
+        min_line=ln,
+        max_line=ln,
+        spread=0,
+        distinct_lines=1,
+        contiguous=True,
+        n_nodes=len(list(gm.graph.nodes)),
+        n_sites=1,
+        files=(f,),
+        funcs=(func,),
+        multi_source_nodes=0,
+    )
+
 
 def out_dir() -> str | None:
     d = os.environ.get(_ENV_DIR)
@@ -198,6 +283,13 @@ def _partition_identity(gm, index: int):
     try:
         sites = ri.node_sites(gm)
         if not sites:
+            # A region that names itself supplies the identity instead of its
+            # FX nodes' stack traces. See `set_declared_identity`.
+            declared = declared_identity()
+            if declared:
+                dname = declared[0]
+                digest = hashlib.sha256(ri.structural_digest(gm).encode()).hexdigest()[:8]
+                return (f"{dname}#{digest}", dname, index)
             return None
         first = min(sites, key=lambda s: s.line)
         if not first.file or first.line <= 0:
@@ -284,6 +376,48 @@ def _seal(reg: _Region) -> None:
         if not part_sites:
             untraced.append(i)
         sites.extend(part_sites)
+
+    # A region that names itself (vllm_gaudi.device_regions.Region) supplies its
+    # identity instead of its FX nodes' stack traces. Its source is the
+    # module-level function it wraps, which is *better* evidence than a line
+    # number, and it is set only by our own code -- so a model region with no
+    # trace still fails exactly as before. See `set_declared_identity`.
+    declared = declared_identity()
+    if not sites and declared:
+        dname, dfile, dline = declared
+        # The name is the declaration; the source annotation is the wrapped
+        # function's own definition site, which is where a hand-written region
+        # really lives -- its FX nodes carry no trace because the ops are minted
+        # inside torch.
+        reg.human = dname
+        reg.name = dname
+        reg.region_id = dname
+        if not enabled():
+            return
+        structures = [ri.structural_digest(gm) for _, gm in reg.parts]
+        digest = hashlib.sha256("\0".join(structures).encode()).hexdigest()[:8]
+        reg.name = f"{dname}#{digest}"
+        reg.region_id = reg.name
+        records = []
+        slot_of = {}
+        for i, (_, gm) in enumerate(reg.parts):
+            rec = ri.RecipeRecord(
+                region_id=reg.region_id,
+                name=reg.name,
+                shape=_declared_shape(ri, gm, declared),
+                structure=ri.structural_digest(gm),
+                discovery_index=i,
+                gm=gm,
+            )
+            records.append(rec)
+            slot_of[id(rec)] = i
+        numbering = ri.assign_ordinals(records)
+        reg.notes.extend(numbering.notes)
+        for rec in numbering.ordered:
+            reg.parts[slot_of[id(rec)]] = (rec, rec.gm)
+        reg.n_recipes = len(records)
+        return
+
     if not sites:
         raise _identity_error(
             reg,
