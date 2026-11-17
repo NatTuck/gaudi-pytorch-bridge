@@ -635,11 +635,20 @@ inline const char* const kTorchInternalFiles[] = {
 // True when the frame that issued this launch is one of PyTorch's own tracing
 // files. NOT a phase test: a violation is a violation during warmup too.
 inline bool is_torch_internal(const Site& s) {
-  if (s.file.empty()) {
+  // WHEN THE DEPTH WALK MOVED THE REPORT, `s.file` IS NO LONGER THE ISSUER.
+  // `python_site(skip, depth)` walks past torch frames and reports the first
+  // non-torch frame, preserving the original in `s.torch_file`. This exemption is
+  // about WHO issued the launch, so it must test the original frame. Testing
+  // `s.file` made every torch-internal launch a violation as soon as
+  // PT_HPU_EAGER_GUARD_DEPTH was set -- measured as 3,186 false violations on a
+  // single DFlash2 boot, all of them tracing copies, all correctly exempt with the
+  // depth walk off. The two settings must not change the classification.
+  const std::string& issuer = s.walked ? s.torch_file : s.file;
+  if (issuer.empty()) {
     return false;
   }
   for (const char* f : kTorchInternalFiles) {
-    if (ends_with(s.file, f)) {
+    if (ends_with(issuer, f)) {
       return true;
     }
   }
