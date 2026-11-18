@@ -382,17 +382,20 @@ void DiskCache::Add(
               "' is empty. It is computed at the request site and must not be "
               "recomputed here. There is deliberately no fallback to the graph "
               "hash.");
-  size_t key_hash = std::hash<std::string>{}(compile_key);
-  auto hashCode = std::to_string(key_hash);
-  recipe_cache_.store(hashCode + cache_id_suffix_, val.rl_->recipe_, ss);
+  // The key string IS the filename component. Hashing it would make the name
+  // unreproducible from Python -- std::hash<std::string> is implementation
+  // defined -- so the warm could not construct a name to check for presence.
+  // The key is already a fixed-width digest of the actual inputs; hashing it
+  // again adds a collision risk and buys nothing.
+  recipe_cache_.store(compile_key + cache_id_suffix_, val.rl_->recipe_, ss);
   if (val.rl_->recipe_ && !val.rl_->recipe_->recipe_name_.empty()) {
     PT_BRIDGE_DEBUG(
         "Storing in disc cache: recipe:key: ",
         val.rl_->recipe_->recipe_name_,
         ":",
-        hashCode);
+        compile_key);
   } else {
-    PT_BRIDGE_DEBUG("Storing only metadata in disc cache, key: ", hashCode);
+    PT_BRIDGE_DEBUG("Storing only metadata in disc cache, key: ", compile_key);
   }
 
   static const auto dump_debug_info =
@@ -403,7 +406,7 @@ void DiskCache::Add(
         ? val.rl_->recipe_->recipe_name_
         : "recipe " + std::to_string(debug_id++);
     std::string hash_content_filepath = recipe_cache_.get_cache_path() + "/" +
-        hashCode + cache_id_suffix_ + "_" + recipe_name + ".hash_content";
+        compile_key + cache_id_suffix_ + "_" + recipe_name + ".hash_content";
     std::ofstream hash_content_file(hash_content_filepath.c_str());
     if (!hash_content_file.is_open()) {
       LOG(FATAL) << "Failed to open hash content file for writing...";
@@ -429,9 +432,7 @@ std::shared_ptr<RecipeHolder> DiskCache::Find(
     return nullptr;
   }
   std::stringstream ss;
-  auto recipe = recipe_cache_.lookup(
-      std::to_string(std::hash<std::string>{}(compile_key)) + cache_id_suffix_,
-      ss);
+  auto recipe = recipe_cache_.lookup(compile_key + cache_id_suffix_, ss);
   return recipe ? std::make_shared<RecipeHolder>(ss, *recipe) : nullptr;
 }
 // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
