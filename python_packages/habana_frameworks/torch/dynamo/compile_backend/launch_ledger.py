@@ -371,7 +371,7 @@ def record_partition(graph_name: str, gm) -> "Handle | None":
         from ._recipe_compiler_C import note_region  # noqa: PLC0415
         from . import compile_inputs as _ci  # noqa: PLC0415
 
-        _key = declared_compile_key()
+        _key = _ci.frame_record(name, ident[0], gm).key()
         note_region(graph_name, name, source, idx, _key)
     return Handle(graph_name, index)
 

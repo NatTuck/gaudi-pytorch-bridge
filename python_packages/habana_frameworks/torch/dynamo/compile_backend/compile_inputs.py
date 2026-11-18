@@ -738,3 +738,45 @@ def make_record(fn, args, kwargs, module) -> CompileInputs:
         region=(("name", name), ("code", code)),
         shapes=tuple(shapes),
     )
+
+
+def frame_record(name: str, identity: str, gm) -> CompileInputs:
+    """The record for ONE FX frame, from what the frame already holds.
+
+    PER FRAME, NOT PER REGION. One `torch.compile` target can produce many
+    frames -- one per inner function dynamo compiles -- and keying them all by
+    the *outer* call's arguments makes every frame after the first load the first
+    frame's recipe. Measured: key `c34a07e9` was asked for by both
+
+        graph_0115  identity=FusedRMSNorm.py:forward#f5cddcdf
+        graph_0116  identity=qwen3_5.py:_resolve_state_indices#3ae6a6e6
+
+    both `region=model.forward`, and the arity mismatch that killed serving
+    (`running index 4 mismatch with num_inputs 3`) came from exactly that.
+
+    The frame's own placeholders are the inputs the compile actually sees, so
+    they are the inputs the key has to describe.
+
+    COST, stated plainly: this key is computed AFTER tracing. A cache hit
+    therefore skips the Synapse compile (2-3 s per graph) but NOT the trace.
+    That is a real win, and it is not a trace-free hit -- the trace-free hit was
+    given up deliberately when the unit moved from region to frame.
+    """
+    shapes = []
+    for node in gm.graph.nodes:
+        if node.op != "placeholder":
+            continue
+        value = node.meta.get("example_value")
+        if value is None:
+            # The frame's input has no example value, so its shape cannot be
+            # read. Recording the fact is weaker than recording the shape, but
+            # it is not a silent omission: two frames differing only here still
+            # get different keys if their placeholder sets differ.
+            shapes.append(("placeholder-without-value", node.name))
+        else:
+            shapes.extend(_signature_of(value, node.name))
+    return build(
+        instance=(),
+        region=(("name", name), ("code", identity)),
+        shapes=tuple(shapes),
+    )
