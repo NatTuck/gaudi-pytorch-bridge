@@ -121,7 +121,7 @@ std::shared_ptr<RecipeHolder> RecipeCacheLRU::get(
 
     return list_.front().second;
   } else if (disk_cache_) {
-    auto val = disk_cache_->Find(*key, compile_key);
+    auto val = disk_cache_->Find(compile_key);
     if (val) {
       PT_BRIDGE_DEBUG(
           "recipe was not found in LRU cache, but was found on disk, key:",
@@ -286,7 +286,7 @@ void RecipeCacheLRU::Serialize() {
       // there is nothing to flush.
       continue;
     }
-    auto val = disk_cache_->Find(*(ele.first), compile_key);
+    auto val = disk_cache_->Find(compile_key);
     if (val == nullptr) {
       disk_cache_->Add(*(ele.second), *(ele.first), compile_key);
     }
@@ -419,7 +419,6 @@ void DiskCache::flush() {
 
 // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
 std::shared_ptr<RecipeHolder> DiskCache::Find(
-    const RecipeArgumentSpec& spec,
     const std::string& compile_key) {
   // THE SAME KEY THE STORE USED. It arrives as an argument from the request
   // site; it is NOT derived here. Deriving it from `spec.hashCode()` is what

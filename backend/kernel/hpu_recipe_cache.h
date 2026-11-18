@@ -54,9 +54,7 @@ class DiskCache {
       const RecipeHolder& val,
       const RecipeArgumentSpec& spec,
       const std::string& compile_key);
-  std::shared_ptr<RecipeHolder> Find(
-      const RecipeArgumentSpec& spec,
-      const std::string& compile_key);
+  std::shared_ptr<RecipeHolder> Find(const std::string& compile_key);
   // in case RecipeValueSpec creation failed, DiskCache is leaving lock files on
   // disk. This ensures a cleanup.
   void flush();

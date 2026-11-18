@@ -5155,7 +5155,7 @@ std::string one_line(std::string s) {
 // Identity for counting invocations. The op list of the lowered IR is what the
 // .metadata carries and what DET hashed; the counters are left in because this
 // value only has to be stable within one process.
-std::string region_identity(const std::string& op_strs) {
+std::string probe_op_identity(const std::string& op_strs) {
   std::hash<std::string> h;
   return std::to_string(h(op_strs));
 }
@@ -5658,7 +5658,7 @@ void HabanaLaunchOpPT::ProbeRegionArtifact() {
     return;
   }
 
-  const std::string identity = region_identity(op_strs);
+  const std::string identity = probe_op_identity(op_strs);
 
   if (state.list_only) {
     std::lock_guard<std::mutex> lock(state.mtx);
@@ -6410,7 +6410,7 @@ void HabanaLaunchOpPT::CompileLazyGraphInParallel() {
       [recipe_done = std::move(recipe_done),
        syn_graph_ptr = syn_graph_ptr_,
        cur_rargpsh = cur_rargpsh_,
-       rvs]() mutable {
+       rvs, this]() mutable {
         auto recipe = syn_graph_ptr->compile();
         rvs->populate_syn_tensor_ids(*recipe);
         rvs->collective_kernels_info->ClearAllPtAndSynTensors();
