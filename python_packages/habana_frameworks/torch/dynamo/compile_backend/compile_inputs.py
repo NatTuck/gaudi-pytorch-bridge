@@ -599,6 +599,21 @@ def _signature_of(value, where: str):
         return [("bool", value)]
     if isinstance(value, int):
         return [("int", value)]
+    # TYPES THAT GENUINELY CHANGE THE LOWERED GRAPH. Each gets a STABLE CANONICAL
+    # form -- `str(dtype)`, `str(device)`, the string itself -- never `repr` of an
+    # object carrying an address, which would change the key every process.
+    if isinstance(value, torch.dtype):
+        return [("dtype", str(value))]
+    if isinstance(value, torch.device):
+        return [("device", str(value))]
+    if isinstance(value, float):
+        return [("float", repr(value))]
+    if isinstance(value, str):
+        return [("str", value)]
+    if value is None:
+        # `None` IS A VALUE dynamo guards on. Recorded explicitly so it stays
+        # distinguishable from an argument that is absent entirely.
+        return [("none", None)]
     if isinstance(value, (list, tuple)):
         out = []
         for i, item in enumerate(value):
