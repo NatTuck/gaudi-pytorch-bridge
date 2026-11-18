@@ -616,29 +616,84 @@ def _signature_of(value, where: str):
         f"silently dropping this argument would produce a key that omits it.")
 
 
-def _instance_attributes(module) -> tuple:
-    """The dynamo-guarded attributes, read off the module object.
+# id(model) -> (model, locations). Keyed on the model OBJECT's identity, not a
+# timestamp: the model is constructed once per process, so process lifetime is the
+# right bound, and a rebuilt model gets a fresh id.
+_LOCATION_CACHE: dict = {}
 
-    `getattr` on the object is exactly what dynamo guards; nothing here needs a
-    trace. An attribute that is ABSENT is recorded as absent, which is itself a
-    guarded fact -- `KeyError on self._modules['linear_attn']` is a real guard we
-    have seen fire.
+
+def _walk_modules(root):
+    """(qualified_path, module) for the root and every descendant module."""
+    yield "", root
+    seen = {id(root)}
+    stack = [("", root)]
+    while stack:
+        path, mod = stack.pop()
+        for name, child in list(getattr(mod, "_modules", {}).items()):
+            if child is None or id(child) in seen:
+                continue
+            seen.add(id(child))
+            child_path = f"{path}.{name}" if path else name
+            yield child_path, child
+            stack.append((child_path, child))
+
+
+def _resolve_path(root, path):
+    """`getattr` down a dotted path from `root`."""
+    mod = root
+    for part in path.split("."):
+        if not part:
+            continue
+        mod = getattr(mod, part, None)
+        if mod is None:
+            return None
+    return mod
+
+
+def _attribute_locations(model) -> tuple:
+    """Every (path, attribute) occurrence of a guarded attribute in the model tree.
+
+    BUILT ONCE PER MODEL OBJECT and cached on its identity. The walk is the
+    expensive part and the model's STRUCTURE does not change after construction;
+    only the values do, which is read per compile through these paths.
+
+    ALL LAYERS ARE INCLUDED, not just the ones a guard has named. Over-coarse costs
+    a spurious miss; under-coarse gives two different graphs one key, which is the
+    `synStatus 30` this whole thread exists to remove. That is a deliberate §8
+    trade: a shared entry would violate "invalidate only if the recipe changed",
+    and safety wins.
     """
-    out = []
+    key = id(model)
+    hit = _LOCATION_CACHE.get(key)
+    if hit is not None and hit[0] is model:
+        return hit[1]
+    locations = []
+    modules = 0
+    for path, mod in _walk_modules(model):
+        modules += 1
+        for name in _GUARDED_ATTRS:
+            if hasattr(mod, name):
+                locations.append((path, name))
+    locations = tuple(locations)
+    logger.info("attr-locations: %d paths over %d modules", len(locations), modules)
+    _LOCATION_CACHE[key] = (model, locations)
+    return locations
+
+
+def _instance_attributes(module) -> tuple:
+    """The guarded attributes, read through the cached location map.
+
+    `ABSENT` IS A RECORDED VALUE, not a skip. Dynamo guards on absence too --
+    `KeyError on self._modules['linear_attn']` is a guard we have seen fire -- so
+    "this module has no linear_attn" is a different graph from "it has one".
+    """
     if module is None:
         return ()
-    for name in _GUARDED_ATTRS:
-        out.append((name, getattr(module, name, "<absent>")))
-    # Module presence: the linear/full attention split is a real graph difference.
-    mods = getattr(module, "_modules", None)
-    if isinstance(mods, dict):
-        out.append(("__modules__", tuple(sorted(mods))))
-    layers = getattr(module, "_layers", None)
-    if layers is not None:
-        try:
-            out.append(("len(_layers)", len(layers)))
-        except TypeError:
-            out.append(("len(_layers)", "<unlenable>"))
+    out = []
+    for path, name in _attribute_locations(module):
+        obj = _resolve_path(module, path)
+        value = getattr(obj, name, "ABSENT") if obj is not None else "ABSENT"
+        out.append((f"{path}.{name}" if path else name, value))
     return tuple(out)
 
 
