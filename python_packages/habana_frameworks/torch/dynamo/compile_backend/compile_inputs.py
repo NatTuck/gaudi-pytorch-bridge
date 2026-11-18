@@ -7,24 +7,18 @@ argument is a defect, not something to accommodate with a bigger hash. This modu
 is the single place ambient state is read; everything on the compile path reads
 the frozen values captured here.
 
-## What was implicit, and is now explicit
+## The key
 
-The audit found six categories. Two were already explicit (the graph, and the
-tensor metadata). This module makes four of the rest explicit:
+    hash( code_identity, shapes, ints, context, config,
+          torch_version, synapse_version, bridge_source )
 
-    context  grad_enabled, inference_mode, num_threads, default_dtype
-    config   the flags that change the lowered graph, plus a digest of the WHOLE
-             environment so an unenumerated variable still shows up
-    instance whatever Python values the caller declares it depends on
-    region   a bytecode hash of the region's function
+`code_identity` is a NORMALISED-AST hash of the region function plus every
+in-file function it transitively calls -- see `code_identity` below for why it is
+an AST and not bytecode.
 
-## What this does NOT do
-
-The graph hash remains the real cache key. This record is built alongside it and
-logged, so the two can be compared. Flipping the key is stage 2 and needs a bridge
-change -- `libs_env_hash`, `PT_RECIPE_CACHE_IGNORE_VERSION`, the shape-inference
-flags, `unique_graph_cntr` and `op_strs` are all inside the C++ bridge and cannot
-be supplied from here.
+Nothing graph-derived is in the key: `op_strs`, the graph topology and the graph
+hash are all computed AFTER tracing, so keying on them would make the key
+uncomputable without tracing, which is the thing we are trying to avoid.
 
 ## What there is NOT
 
@@ -216,3 +210,218 @@ def build(*, instance: tuple = (), region: tuple = (), shapes: tuple = ()) -> Co
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Code identity: a normalised-AST hash of the region and its in-file closure
+# ---------------------------------------------------------------------------
+
+# Directories whose source participates in the identity. Anything else (torch,
+# stdlib, Synapse) is opaque and is identified by version instead.
+_PROJECT_ROOTS = ("vllm-gaudi", "vllm-core", "gaudi-pytorch-bridge")
+
+# (path, mtime) -> parsed Module. A repeat call for the same file must NOT re-parse:
+# that is what the counter assertion below is for.
+_PARSE_CACHE: dict[tuple[str, float], object] = {}
+_PARSE_COUNT = 0
+
+
+def parse_count() -> int:
+    """How many times `ast.parse` has actually run. The counter assertion reads it."""
+    return _PARSE_COUNT
+
+
+def reset_parse_cache() -> None:
+    """Test seam: drop the parse cache and the counter."""
+    global _PARSE_COUNT
+    _PARSE_CACHE.clear()
+    _PARSE_COUNT = 0
+
+
+def _in_project(path: str) -> bool:
+    return any(root in path for root in _PROJECT_ROOTS)
+
+
+def _parse(path: str):
+    """Parse `path`, cached by (path, mtime). Counts real parses."""
+    global _PARSE_COUNT
+    import ast
+    import os
+
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = (path, mtime)
+    hit = _PARSE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            source = stream.read()
+    except OSError:
+        return None
+    _PARSE_COUNT += 1
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    _PARSE_CACHE[key] = tree
+    return tree
+
+
+def _strip_docstrings(node):
+    """Remove docstring Expr(Constant(str)) nodes, in place.
+
+    A docstring is documentation, not logic: PROTOCOL §8 says an invalidation is
+    legitimate only if the recipe actually changed, and a docstring does not change
+    a lowered graph. Comments never reach an AST at all.
+    """
+    import ast
+
+    for child in ast.walk(node):
+        body = getattr(child, "body", None)
+        if not isinstance(body, list) or not body:
+            continue
+        first = body[0]
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            body.pop(0)
+    return node
+
+
+def _module_functions(tree) -> dict:
+    """Top-level functions in one module, by name."""
+    import ast
+
+    return {n.name: n for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def _names_used(node) -> set:
+    """Every bare name and attribute base referenced inside `node`."""
+    import ast
+
+    out = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            out.add(child.id)
+        elif isinstance(child, ast.Attribute):
+            base = child
+            while isinstance(base, ast.Attribute):
+                base = base.value
+            if isinstance(base, ast.Name):
+                out.add(base.id)
+    return out
+
+
+def _closure(path: str, fn_name: str):
+    """The in-file transitive closure of `fn_name`, as a sorted list of (name, node).
+
+    BOUNDED TO ONE FILE BY MEASUREMENT: every compiled region's in-project closure
+    is exactly one file -- 56 regions, 19 files, zero closures spanning more than
+    one file. So no cross-file walk is needed, and a cross-file call is treated as
+    opaque rather than chased.
+    """
+    tree = _parse(path)
+    if tree is None:
+        return []
+    funcs = _module_functions(tree)
+    if fn_name not in funcs:
+        return []
+    seen = set()
+    queue = [fn_name]
+    while queue:
+        name = queue.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        node = funcs.get(name)
+        if node is None:
+            continue
+        for used in _names_used(node):
+            if used in funcs and used not in seen:
+                queue.append(used)
+    return [(name, funcs[name]) for name in sorted(seen)]
+
+
+def code_identity(fn) -> str:
+    """hash(normalised AST of fn + every in-file function it transitively calls).
+
+    Normalised: docstrings stripped, no line numbers, no attributes, fields
+    unannotated. Two files differing only in comments or whitespace produce the
+    same digest, which is the PROTOCOL §8 requirement.
+
+    A function whose source cannot be resolved raises `UnnamedCompile` rather than
+    returning a placeholder: a placeholder would keep working while keyed on
+    something we cannot see, and nobody would know which compiles were doing it.
+    """
+    import ast
+    import hashlib
+
+    path = getattr(getattr(fn, "__code__", None), "co_filename", None)
+    qualname = getattr(fn, "__qualname__", getattr(fn, "__name__", None))
+    if not path or not qualname:
+        raise UnnamedCompile(
+            f"cannot resolve code identity for {fn!r}: no __code__.co_filename or "
+            f"__qualname__. A region must wrap a module-level function in project "
+            f"source; a lambda, a bound method of a builtin, or a functools.partial "
+            f"has no source to hash.")
+    if not _in_project(path):
+        raise UnnamedCompile(
+            f"cannot resolve code identity for {qualname} at {path}: the file is not "
+            f"under any of {_PROJECT_ROOTS}, so its source is not part of the key. "
+            f"Regions must wrap project code; library code is identified by version.")
+
+    # Methods appear as "Class.method"; the closure walk works on module-level names.
+    name = qualname.split(".")[-1]
+    entries = _closure(path, name)
+    if not entries:
+        raise UnnamedCompile(
+            f"cannot resolve code identity for {qualname} at {path}: no module-level "
+            f"function named {name!r} was found. If the region wraps a method, wrap "
+            f"the module-level function it calls instead.")
+
+    h = hashlib.blake2b(digest_size=16)
+    for entry_name, node in entries:
+        normalised = _strip_docstrings(node)
+        h.update(entry_name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(ast.dump(normalised, annotate_fields=False,
+                          include_attributes=False).encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+# Region name -> code identity, registered where the function object exists (the
+# `Region` wrapper) and looked up here where only the name exists (the launcher).
+_region_code: dict[str, str] = {}
+
+
+def register_region_code(name: str, fn: Any) -> None:
+    """Record a region's code identity. Called by `Region.__init__`.
+
+    USES `code_identity`, NOT `code_hash`. The bytecode hash was interpreter-
+    dependent (`co_code` changes with the Python version and with `-O`), which made
+    the key implicitly depend on the interpreter.
+
+    RAISES `UnnamedCompile` WHEN IT CANNOT RESOLVE. No try/except here: a swallowed
+    failure is a compile keyed on something we cannot see, and nobody would know
+    which ones. Failing at construction is also the completeness check -- the first
+    boot reports the true population of compiled regions.
+    """
+    _region_code[name] = code_identity(fn)
+
+
+def region_code(name: str) -> str:
+    return _region_code.get(name, "unknown")
+
+
+class UnnamedCompile(RuntimeError):
+    """A compile reached the key with no resolvable code identity. Fatal by design.
+
+    The alternative -- falling back to the graph hash -- would keep working while
+    keyed on something explicitly ruled out, and nobody would know which compiles
+    were doing it. Raising also gives the true population of compiled regions on
+    the first boot, which closes the "how many are there really" gap.
+    """
