@@ -166,11 +166,16 @@ def code_hash(fn: Any) -> str:
 class CompileInputs:
     """The explicit record. Frozen, so it cannot drift after construction."""
 
-    context: tuple = ()
-    config: tuple = ()
-    instance: tuple = ()
-    region: tuple = ()
-    shapes: tuple = ()
+    # NO DEFAULTS ON instance/region/shapes. They were defaulted to `()`, so a
+    # caller that forgot one produced a key that looked valid and silently omitted
+    # the input -- which is how one region came to produce ONE key for hundreds of
+    # distinct graphs. `context` and `config` are filled by `build()` itself and
+    # cannot be forgotten.
+    context: tuple
+    config: tuple
+    instance: tuple
+    region: tuple
+    shapes: tuple
 
     def key(self) -> str:
         h = hashlib.blake2b(digest_size=16)
@@ -184,7 +189,7 @@ class CompileInputs:
                 f"instance={self.instance} region={self.region} shapes={self.shapes}")
 
 
-def build(*, instance: tuple = (), region: tuple = (), shapes: tuple = ()) -> CompileInputs:
+def build(*, instance: tuple, region: tuple, shapes: tuple) -> CompileInputs:
     """Construct the record from the frozen snapshot plus explicit arguments.
 
     `instance`, `region` and `shapes` are supplied by the caller because only the
@@ -426,7 +431,7 @@ def region_code(name: str) -> str:
     return _region_code.get(name, "unknown")
 
 
-def key_for_region(name: str) -> str:
+def key_for_region(name: str, *, shapes: tuple, ints: tuple, instance: tuple) -> str:
     """The recipe cache key for a region: hash of every DECLARED input.
 
         hash( code_identity, shapes, ints, context, config,
@@ -441,9 +446,14 @@ def key_for_region(name: str) -> str:
     tracing, and keying on them would make the key uncomputable without tracing,
     which is the thing this work removes.
     """
+    # THE SPECIALISATION PARAMETERS ARE THE POINT OF THE KEY. Without them one
+    # region produces one key for every distinct graph it compiles, the second
+    # graph loads the first's recipe, and the launch dies with
+    # `synStatus 30 [Sections' validation failure]`.
     return build(
-        instance=(("region", name),),
+        instance=tuple(instance),
         region=(("name", name), ("code", region_code(name))),
+        shapes=tuple(shapes) + (("ints", tuple(ints)),),
     ).key()
 
 
