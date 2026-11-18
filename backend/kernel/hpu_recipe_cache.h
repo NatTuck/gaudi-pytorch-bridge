@@ -54,7 +54,21 @@ class DiskCache {
       const RecipeHolder& val,
       const RecipeArgumentSpec& spec,
       const std::string& compile_key);
-  std::shared_ptr<RecipeHolder> Find(const std::string& compile_key);
+  // THE CACHE ARTIFACT IS THE SET OF RECIPES, plus whatever is needed to run
+  // them all on a hit. Today that set is a SINGLETON: a `Region.__call__` traces
+  // to one FX frame, the partitioner leaves it as one `fused_0`, and one recipe
+  // is produced. Measured, not assumed: 2789 graph names across the boot logs,
+  // every one `_fused_0`; five distinct recipe names, all `fused_0`; zero
+  // occurrences of `fused_1` or higher.
+  //
+  // So there is no routing to store and no replay driver to write, and building
+  // that machinery now would be a serialisation format and an executor to carry
+  // a set that always has one element. The shape is chosen deliberately, not by
+  // accident: if a split ever appears, this is where the plan belongs -- an
+  // ordered partition list plus, per partition, the source of each input slot
+  // (a region argument, an earlier partition's output, or a constant).
+  std::shared_ptr<RecipeHolder> Find(const std::string& compile_key,
+                                     const std::string& graph_name);
   // in case RecipeValueSpec creation failed, DiskCache is leaving lock files on
   // disk. This ensures a cleanup.
   void flush();
@@ -104,7 +118,8 @@ class RecipeCacheLRU {
       const std::string& compile_key);
   std::shared_ptr<RecipeHolder> get(
       std::shared_ptr<RecipeArgumentSpec>& key,
-      const std::string& compile_key);
+      const std::string& compile_key,
+      const std::string& graph_name);
   dropped_recipe_t drop_lru();
   void remove_oldest();
   void ResetDiskCache();

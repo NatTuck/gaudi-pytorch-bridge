@@ -634,25 +634,65 @@ inline const char* const kTorchInternalFiles[] = {
 
 // True when the frame that issued this launch is one of PyTorch's own tracing
 // files. NOT a phase test: a violation is a violation during warmup too.
+// True when this launch is happening INSIDE PyTorch's tracing machinery.
+//
+// The question is not "which frame is at the top" but "is a compiler running
+// right now". Dynamo traces a region by EXECUTING it with fake tensors, so the
+// ops inside our own region body dispatch eagerly while it is being compiled --
+// from OUR frame, not torch's. Testing only the reporting frame called those
+// violations: 1,062 on one DFlash2 boot, three per graph, one graph per distinct
+// token count. They are compilation work, not serving work.
+//
+// So walk the stack and accept if ANY frame belongs to one of the tracing files.
+// A dispatch under tracing is inside torch's machinery no matter whose function
+// is executing at the top.
+//
+// Still narrow in the way that matters: `torch/utils/_device.py`
+// `DeviceContext.__torch_function__` is NOT in the list, because it is a context
+// manager wrapping OUR `torch.zeros`, not a compiler. Those stay violations.
 inline bool is_torch_internal(const Site& s) {
-  // WHEN THE DEPTH WALK MOVED THE REPORT, `s.file` IS NO LONGER THE ISSUER.
-  // `python_site(skip, depth)` walks past torch frames and reports the first
-  // non-torch frame, preserving the original in `s.torch_file`. This exemption is
-  // about WHO issued the launch, so it must test the original frame. Testing
-  // `s.file` made every torch-internal launch a violation as soon as
-  // PT_HPU_EAGER_GUARD_DEPTH was set -- measured as 3,186 false violations on a
-  // single DFlash2 boot, all of them tracing copies, all correctly exempt with the
-  // depth walk off. The two settings must not change the classification.
-  const std::string& issuer = s.walked ? s.torch_file : s.file;
-  if (issuer.empty()) {
+  auto matches = [](const std::string& path) {
+    if (path.empty()) {
+      return false;
+    }
+    for (const char* f : kTorchInternalFiles) {
+      if (ends_with(path, f)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // The reported frame may already be the issuer (depth walk off) or our frame
+  // with the original preserved (depth walk on). Both are covered by the walk
+  // below, but checking them first avoids the walk in the common case.
+  if (matches(s.walked ? s.torch_file : s.file)) {
+    return true;
+  }
+  if (!Py_IsInitialized() || PyGILState_GetThisThreadState() == nullptr) {
     return false;
   }
-  for (const char* f : kTorchInternalFiles) {
-    if (ends_with(issuer, f)) {
-      return true;
+  const PyGILState_STATE gil = PyGILState_Ensure();
+  bool found = false;
+  PyFrameObject* walk = PyThreadState_GetFrame(PyThreadState_Get());  // new ref
+  int steps = 0;
+  const int limit = 128;
+  while (walk != nullptr && steps < limit) {
+    Site f;
+    detail::read_frame(walk, f);
+    if (matches(f.file)) {
+      found = true;
+      break;
     }
+    PyFrameObject* back = PyFrame_GetBack(walk);  // new ref
+    Py_DECREF(walk);
+    walk = back;
+    ++steps;
   }
-  return false;
+  if (walk != nullptr) {
+    Py_DECREF(walk);
+  }
+  PyGILState_Release(gil);
+  return found;
 }
 
 template <typename ShapesFn>

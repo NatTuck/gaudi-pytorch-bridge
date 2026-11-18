@@ -963,7 +963,7 @@ class HabanaLaunchOpPT {
     // `hl_logger::logLevelAtLeast(PT_BRIDGE, HLLOG_LEVEL_DEBUG)` -- there is no
     // simple boolean, because these lines are per-compile and would flood a boot.
     const std::string compile_key = CompileKeyForCache();
-    auto rh{HPUDeviceContext::recipe_cache().get(spec_key, compile_key)};
+    auto rh{HPUDeviceContext::recipe_cache().get(spec_key, compile_key, syn_graph_name_)};
     PT_BRIDGE_DEBUG("recipe cache lookup: graph=",
                     syn_graph_name_,
                     " key=",

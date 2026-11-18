@@ -102,7 +102,8 @@ void RecipeCacheLRU::insert(
 
 std::shared_ptr<RecipeHolder> RecipeCacheLRU::get(
     std::shared_ptr<RecipeArgumentSpec>& key,
-    const std::string& compile_key) {
+    const std::string& compile_key,
+    const std::string& graph_name) {
   std::lock_guard<std::mutex> lg(mutex_);
   if (exists(key)) {
     HABANA_ASSERT(
@@ -121,7 +122,7 @@ std::shared_ptr<RecipeHolder> RecipeCacheLRU::get(
 
     return list_.front().second;
   } else if (disk_cache_) {
-    auto val = disk_cache_->Find(compile_key);
+    auto val = disk_cache_->Find(compile_key, graph_name);
     if (val) {
       PT_BRIDGE_DEBUG(
           "recipe was not found in LRU cache, but was found on disk, key:",
@@ -286,7 +287,8 @@ void RecipeCacheLRU::Serialize() {
       // there is nothing to flush.
       continue;
     }
-    auto val = disk_cache_->Find(compile_key);
+    auto val = disk_cache_->Find(compile_key,
+                                 ele.second->rl_->recipe_->recipe_name_);
     if (val == nullptr) {
       disk_cache_->Add(*(ele.second), *(ele.first), compile_key);
     }
@@ -422,7 +424,8 @@ void DiskCache::flush() {
 
 // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
 std::shared_ptr<RecipeHolder> DiskCache::Find(
-    const std::string& compile_key) {
+    const std::string& compile_key,
+    const std::string& graph_name) {
   // THE SAME KEY THE STORE USED. It arrives as an argument from the request
   // site; it is NOT derived here. Deriving it from `spec.hashCode()` is what
   // made every lookup ask for a name no store had ever written.
@@ -433,6 +436,14 @@ std::shared_ptr<RecipeHolder> DiskCache::Find(
   }
   std::stringstream ss;
   auto recipe = recipe_cache_.lookup(compile_key + cache_id_suffix_, ss);
+  // HIT or MISS, and WHICH GRAPH ASKED. The key alone cannot show a collision:
+  // when two different graphs compute the same key, the log shows the same key
+  // twice and looks like a repeat compile of one graph. With the graph name the
+  // collision is a named pair, which is the only form in which the missing input
+  // is fixable.
+  PT_BRIDGE_DEBUG("Disc cache lookup, key: ", compile_key,
+                  " graph: ", graph_name,
+                  recipe ? " HIT" : " MISS");
   return recipe ? std::make_shared<RecipeHolder>(ss, *recipe) : nullptr;
 }
 // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
