@@ -56,13 +56,14 @@ bool RecipeArgumentSpecEqual::operator()(
 
 void RecipeCacheLRU::add(
     std::shared_ptr<RecipeArgumentSpec>& key,
-    std::shared_ptr<RecipeHolder>& val) {
+    std::shared_ptr<RecipeHolder>& val,
+    const std::string& compile_key) {
   std::lock_guard<std::mutex> lg(mutex_);
 
   insert(key, val);
 
   if (disk_cache_) {
-    disk_cache_->Add(*val, *key);
+    disk_cache_->Add(*val, *key, compile_key);
   }
 }
 
@@ -100,7 +101,8 @@ void RecipeCacheLRU::insert(
 }
 
 std::shared_ptr<RecipeHolder> RecipeCacheLRU::get(
-    std::shared_ptr<RecipeArgumentSpec>& key) {
+    std::shared_ptr<RecipeArgumentSpec>& key,
+    const std::string& compile_key) {
   std::lock_guard<std::mutex> lg(mutex_);
   if (exists(key)) {
     HABANA_ASSERT(
@@ -119,7 +121,7 @@ std::shared_ptr<RecipeHolder> RecipeCacheLRU::get(
 
     return list_.front().second;
   } else if (disk_cache_) {
-    auto val = disk_cache_->Find(*key);
+    auto val = disk_cache_->Find(*key, compile_key);
     if (val) {
       PT_BRIDGE_DEBUG(
           "recipe was not found in LRU cache, but was found on disk, key:",
@@ -267,9 +269,26 @@ void RecipeCacheLRU::Serialize() {
   disk_cache_ = std::make_unique<DiskCache>(recipe_cache_config_);
 
   for (const auto& ele : list_) {
-    auto val = disk_cache_->Find(*(ele.first));
+    // The bulk flush has no launch-op context, so it resolves each entry's
+    // record key from its recipe name -- the same registry the request site
+    // reads. The hot path passes the key explicitly; this is the one other place
+    // a key has to be found, and it is not on the serving path.
+    std::string compile_key;
+    if (ele.second && ele.second->rl_ && ele.second->rl_->recipe_) {
+      habana::region_identity::Entry entry;
+      if (habana::region_identity::lookup(
+              ele.second->rl_->recipe_->recipe_name_, entry)) {
+        compile_key = entry.compile_key;
+      }
+    }
+    if (compile_key.empty()) {
+      // Nothing to key it by. The hot-path Add already stored this entry, so
+      // there is nothing to flush.
+      continue;
+    }
+    auto val = disk_cache_->Find(*(ele.first), compile_key);
     if (val == nullptr) {
-      disk_cache_->Add(*(ele.second), *(ele.first));
+      disk_cache_->Add(*(ele.second), *(ele.first), compile_key);
     }
   }
 }
@@ -330,7 +349,8 @@ DiskCache::DiskCache(
 
 void DiskCache::Add(
     const RecipeHolder& val,
-    const RecipeArgumentSpec& argSpec) // NOLINT
+    const RecipeArgumentSpec& argSpec, // NOLINT
+    const std::string& compile_key)
 {
   std::stringstream ss;
   val.Serialize(ss);
@@ -348,22 +368,21 @@ void DiskCache::Add(
   // work removes -- and nobody would know which compiles were doing it. Raising is
   // also the completeness instrument: the first boot reports the true population of
   // compiled regions instead of silently keying some of them on the graph.
+  // THE KEY IS GIVEN, NOT RESOLVED. It was computed ONCE at the request site
+  // (`HabanaLaunchOpPT::GetCachedRecipe`) and travelled here as an argument, so
+  // the store and the load cannot disagree. Resolving it again here was the
+  // second computation -- the defect that made `Add` write under the record key
+  // while `Find` looked under the graph hash, so the disk cache never hit.
   TORCH_CHECK(val.rl_ != nullptr && val.rl_->recipe_ != nullptr,
               "recipe cache key: this entry has no recipe, so there is no graph "
-              "name to resolve a code identity against.");
-  habana::region_identity::Entry entry;
-  TORCH_CHECK(habana::region_identity::lookup(val.rl_->recipe_->recipe_name_, entry),
-              "recipe cache key: NO code identity is registered for graph '",
+              "name to attach a key to.");
+  TORCH_CHECK(!compile_key.empty(),
+              "recipe cache key: the compile key for graph '",
               val.rl_->recipe_->recipe_name_,
-              "'. Every compiled graph must go through a Region (or the compile "
-              "entry must register one) so its key is a function of its inputs. "
-              "There is deliberately no fallback to the graph hash.");
-  TORCH_CHECK(!entry.compile_key.empty(),
-              "recipe cache key: the identity registered for graph '",
-              val.rl_->recipe_->recipe_name_,
-              "' carries no compile key. Register one via note_region(..., "
-              "compile_key) before the graph compiles.");
-  size_t key_hash = std::hash<std::string>{}(entry.compile_key);
+              "' is empty. It is computed at the request site and must not be "
+              "recomputed here. There is deliberately no fallback to the graph "
+              "hash.");
+  size_t key_hash = std::hash<std::string>{}(compile_key);
   auto hashCode = std::to_string(key_hash);
   recipe_cache_.store(hashCode + cache_id_suffix_, val.rl_->recipe_, ss);
   if (val.rl_->recipe_ && !val.rl_->recipe_->recipe_name_.empty()) {
@@ -399,10 +418,21 @@ void DiskCache::flush() {
 }
 
 // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
-std::shared_ptr<RecipeHolder> DiskCache::Find(const RecipeArgumentSpec& spec) {
+std::shared_ptr<RecipeHolder> DiskCache::Find(
+    const RecipeArgumentSpec& spec,
+    const std::string& compile_key) {
+  // THE SAME KEY THE STORE USED. It arrives as an argument from the request
+  // site; it is NOT derived here. Deriving it from `spec.hashCode()` is what
+  // made every lookup ask for a name no store had ever written.
+  if (compile_key.empty()) {
+    // No identity for this graph: there is nothing to look up. A miss, not a
+    // failure -- the store side is where an unnamed compile is fatal.
+    return nullptr;
+  }
   std::stringstream ss;
   auto recipe = recipe_cache_.lookup(
-      std::to_string(spec.hashCode()) + cache_id_suffix_, ss);
+      std::to_string(std::hash<std::string>{}(compile_key)) + cache_id_suffix_,
+      ss);
   return recipe ? std::make_shared<RecipeHolder>(ss, *recipe) : nullptr;
 }
 // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)

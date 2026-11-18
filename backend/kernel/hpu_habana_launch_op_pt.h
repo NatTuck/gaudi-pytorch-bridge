@@ -29,6 +29,7 @@
 #include "backend/helpers/tensor_utils.h"
 #include "backend/jit_graph_cache.h"
 #include "backend/kernel/constant_information.h"
+#include "backend/synapse_helpers/region_identity_registry.h"
 #include "backend/kernel/hpu_shape_inference.h"
 #include "habana_lazy/hpu_lazy_tensors.h"
 #include "hpu_habana_cache.h"
@@ -924,9 +925,30 @@ class HabanaLaunchOpPT {
       bool is_restride_cl);
   void handleMetaOps(habana_torch::jit::Node* node);
 
+  // The CompileInputs record key for THIS graph, resolved from the identity
+  // registry. `syn_graph_name_` is set in the constructor, so it is available
+  // here, before any recipe exists -- which is the point: the key is a function
+  // of the declared inputs and needs no trace.
+  //
+  // ONE COMPUTATION. This value is passed to the cache load here and to the
+  // cache store at the `add()` call sites, so the two cannot disagree. Two
+  // independent computations is what broke the disk cache.
+  //
+  // The registry normalises both the Python frame name and the synapse recipe
+  // name to `frame_key` ("graph_<id>"), so looking up `syn_graph_name_` finds
+  // what `note_region` registered under the frame name.
+  std::string CompileKeyForCache() const {
+    habana::region_identity::Entry entry;
+    if (!habana::region_identity::lookup(syn_graph_name_, entry)) {
+      return {};
+    }
+    return entry.compile_key;
+  }
+
   std::shared_ptr<RecipeHolder> GetCachedRecipe(
       std::shared_ptr<RecipeArgumentSpec>& spec_key) {
-    auto rh{HPUDeviceContext::recipe_cache().get(spec_key)};
+    auto rh{HPUDeviceContext::recipe_cache().get(spec_key,
+                                                 CompileKeyForCache())};
     if (nullptr != rh && nullptr == rh->rvs_->jit_graph_) {
       rh->rvs_->jit_graph_ = jit_ir_graph_;
     }

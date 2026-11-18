@@ -44,8 +44,19 @@ struct RecipeArgumentSpecEqual {
 class DiskCache {
  public:
   DiskCache(const serialization::RecipeCacheConfig& recipe_cache_config);
-  void Add(const RecipeHolder& val, const RecipeArgumentSpec& spec);
-  std::shared_ptr<RecipeHolder> Find(const RecipeArgumentSpec& spec);
+  // `compile_key` is the CompileInputs record key, computed ONCE at the request
+  // site (`HabanaLaunchOpPT::GetCachedRecipe`) and used for BOTH the store and
+  // the load. Computing it separately on each side is what broke the disk
+  // cache: `Add` wrote under the record key while `Find` looked under the graph
+  // hash, so every store was invisible to every load and the cache could never
+  // hit.
+  void Add(
+      const RecipeHolder& val,
+      const RecipeArgumentSpec& spec,
+      const std::string& compile_key);
+  std::shared_ptr<RecipeHolder> Find(
+      const RecipeArgumentSpec& spec,
+      const std::string& compile_key);
   // in case RecipeValueSpec creation failed, DiskCache is leaving lock files on
   // disk. This ensures a cleanup.
   void flush();
@@ -91,8 +102,11 @@ class RecipeCacheLRU {
 
   void add(
       std::shared_ptr<RecipeArgumentSpec>& key,
-      std::shared_ptr<RecipeHolder>& val);
-  std::shared_ptr<RecipeHolder> get(std::shared_ptr<RecipeArgumentSpec>& key);
+      std::shared_ptr<RecipeHolder>& val,
+      const std::string& compile_key);
+  std::shared_ptr<RecipeHolder> get(
+      std::shared_ptr<RecipeArgumentSpec>& key,
+      const std::string& compile_key);
   dropped_recipe_t drop_lru();
   void remove_oldest();
   void ResetDiskCache();

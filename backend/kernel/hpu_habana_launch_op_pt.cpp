@@ -6416,7 +6416,8 @@ void HabanaLaunchOpPT::CompileLazyGraphInParallel() {
         rvs->collective_kernels_info->ClearAllPtAndSynTensors();
         auto recipe_launcher = std::make_shared<RecipeLauncher>(*rvs, recipe);
         auto rh = std::make_shared<RecipeHolder>(recipe_launcher, rvs);
-        HPUDeviceContext::recipe_cache().add(cur_rargpsh, rh);
+        HPUDeviceContext::recipe_cache().add(
+            cur_rargpsh, rh, CompileKeyForCache());
         PT_BRIDGE_DEBUG(
             "HabanaOp recipe cache :: adding new recipe to cache :: ",
             rvs->key);
@@ -6617,7 +6618,8 @@ void HabanaLaunchOpPT::CompileGraphWithRange(
   rvs->set_op_strs(cur_rargpsh_->get_op_strs());
   recipe_launcher_ = std::make_unique<RecipeLauncher>(*rvs, recipe);
   auto recipe_holder = std::make_shared<RecipeHolder>(recipe_launcher_, rvs);
-  HPUDeviceContext::recipe_cache().add(cur_rargpsh_, recipe_holder);
+  HPUDeviceContext::recipe_cache().add(
+      cur_rargpsh_, recipe_holder, CompileKeyForCache());
   DynamicBucketInfoMap::get_instance().add(cur_rargpsh_, current_dbipsh_);
 
   new_recipe_key = cur_rargpsh_->hashCode();
