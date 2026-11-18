@@ -647,8 +647,14 @@ def optimize_graph(
         dump_fx_graph(ctx.graph_module, graph_name, stage=stage, pass_counter=pass_counter)
         for optimization_pass in get_passes(stage):
             pass_name = optimization_pass.__name__
-            env_name = "PT_HPU_DISABLE_" + pass_name
-            if os.getenv(env_name, "").upper() in ["ON", "1", "YES", "TRUE", "Y"]:
+            # A LOOKUP IN THE BOOT SNAPSHOT, not an `os.getenv` per compile.
+            # The disabled-pass set is fixed at boot by ruling: nobody needs to
+            # flip it between compiles, and an ambient read here made the pass set
+            # a function of the environment at the moment of compilation, with
+            # nothing recording it.
+            from habana_frameworks.torch.dynamo.compile_backend import compile_inputs
+
+            if compile_inputs.pass_disabled(pass_name):
                 logger.debug(f"pass {pass_name} was disabled by env at stage {stage}")
                 continue
 

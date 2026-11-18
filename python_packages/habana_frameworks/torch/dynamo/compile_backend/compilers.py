@@ -139,7 +139,9 @@ def hpu_compiler_inner(
     """
     graph_module = copy_graph_if_backward(graph_module_org, is_backward)
 
-    if not is_training and str_to_bool(os.environ.get("PT_HPU_USE_FUSE_SDPA_PASS", "False")):
+    from habana_frameworks.torch.dynamo.compile_backend import compile_inputs as _ci
+
+    if not is_training and _ci.flag("PT_HPU_USE_FUSE_SDPA_PASS"):
         # optimize the module before partitioning it
         # we will fuse the attention module here
         from habana_frameworks.torch.dynamo.compile_backend._passes.fuse_attention import (

@@ -271,7 +271,9 @@ def hpu_partition(
 
     # optimize the joint module before partitioning it
     # we will fuse the attention module here
-    if str_to_bool(os.environ.get("PT_HPU_USE_FUSE_SDPA_PASS", "False")) is True:
+    from habana_frameworks.torch.dynamo.compile_backend import compile_inputs as _ci
+
+    if _ci.flag("PT_HPU_USE_FUSE_SDPA_PASS"):
         from habana_frameworks.torch.dynamo.compile_backend._passes.fuse_attention import (
             hpu_recursive_joint_graph_passes,
         )
