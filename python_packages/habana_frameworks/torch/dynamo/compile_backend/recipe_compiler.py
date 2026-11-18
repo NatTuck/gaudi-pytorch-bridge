@@ -274,6 +274,15 @@ def _region_hint() -> str:
 
 def check_postwarmup_compile(graph_name: str) -> None:
     """Enforce policy B for one compile."""
+    # Warmup-item logging: this function is called immediately before
+    # `graph_compile`, and a disk-cache HIT does not reach `graph_compile`, so
+    # reaching here is exactly what "MISS" means.
+    try:
+        from vllm_gaudi.v1.worker import warmup_item_log as _wil  # noqa: PLC0415
+
+        _wil.note_compile(graph_name)
+    except Exception:  # noqa: BLE001 - logging must never break a compile
+        pass
     policy = _postwarmup_policy()
     if policy == "off" or in_warmup_phase():
         return
@@ -471,6 +480,23 @@ class HabanaGraphModule(torch.nn.Module):
             # written: (recipe_id -> region name, `foo.N`). One write per
             # compiled recipe, at compile time, off the launch path.
             launch_ledger.note_recipe(self._recipe_id, self._ledger_handle)
+
+            # Compile-inputs record, built ALONGSIDE the real key. Stage 1: the
+            # graph hash above remains the cache key; this only observes. The
+            # detector in `record()` is the instrument for finding an input we
+            # failed to enumerate, so it has to be wired to the place the recipe
+            # id is known -- otherwise it is dead code that looks like coverage.
+            try:
+                from habana_frameworks.torch.dynamo.compile_backend import (
+                    compile_inputs as _ci,
+                )
+                _ci.record(
+                    _ci.build(instance=(("region", self._name),),
+                              region=(("name", self._name),
+                                      ("code", _ci.region_code(self._name)))),
+                    self._recipe_id)
+            except Exception:  # noqa: BLE001 - instrumentation must never break a compile
+                pass
 
         elif self._has_randoms:
             inputs = (None, None) + inputs

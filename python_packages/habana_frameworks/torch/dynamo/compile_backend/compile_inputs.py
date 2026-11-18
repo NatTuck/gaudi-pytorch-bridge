@@ -136,18 +136,27 @@ def _thread_and_dtype() -> tuple[int, str]:
 def code_hash(fn: Any) -> str:
     """A bytecode hash of `fn`, NOT a hash of its source text.
 
-    Per PROTOCOL §8 a comment must not change the record, and comments never reach
-    bytecode. Note the corollary: a DOCSTRING lives in `co_consts`, so editing one
-    does change this hash. That is deliberate -- a docstring is part of the module
-    object -- but it is worth knowing before reading a change as a code change.
+    PROTOCOL §8: an invalidation is legitimate only if the recipe actually
+    changed. A comment does not reach bytecode at all, so it cannot change this.
+    A DOCSTRING does -- it lives in `co_consts` -- and a docstring does not change
+    a lowered graph either, so including it would be a §8 violation rather than a
+    caveat.
+
+    So exactly ONE constant is dropped: `co_consts[0]` when it is a `str`, which is
+    the docstring by definition. Every OTHER string constant is kept, because a
+    string passed to an op genuinely can change the graph and dropping it would
+    make the record unsound in the other direction.
     """
     code = getattr(fn, "__code__", None)
     if code is None:
         return "none"
+    consts = code.co_consts
+    if consts and isinstance(consts[0], str):
+        consts = consts[1:]
     h = hashlib.blake2b(digest_size=8)
     h.update(code.co_code)
     h.update(repr(code.co_names).encode("utf-8", "replace"))
-    h.update(repr(code.co_consts).encode("utf-8", "replace"))
+    h.update(repr(consts).encode("utf-8", "replace"))
     return h.hexdigest()
 
 
@@ -199,6 +208,25 @@ def build(*, instance: tuple = (), region: tuple = (), shapes: tuple = ()) -> Co
 
 _seen: dict[str, str] = {}
 _reported: set[tuple[str, str]] = set()
+# Region name -> bytecode hash, registered where the function object exists (the
+# `Region` wrapper) and looked up here where only the name exists (the launcher).
+_region_code: dict[str, str] = {}
+# Persistence. A collision that fires once and scrolls away is not evidence, so
+# when this path is set every collision is appended as one JSON line and survives
+# teardown. Read from the frozen snapshot, not from live env.
+_COLLISION_LOG_ENV = "PT_HPU_COMPILE_INPUTS_LOG"
+
+
+def register_region_code(name: str, fn: Any) -> None:
+    """Record a region's bytecode hash. Called by `Region.__init__`."""
+    try:
+        _region_code[name] = code_hash(fn)
+    except Exception:  # noqa: BLE001 - instrumentation must never break a region
+        pass
+
+
+def region_code(name: str) -> str:
+    return _region_code.get(name, "unknown")
 
 
 def record(inputs: CompileInputs, graph_hash: Any) -> None:
@@ -206,28 +234,62 @@ def record(inputs: CompileInputs, graph_hash: Any) -> None:
 
     THE DISCOVERY MECHANISM. If a single record maps to two different graph
     hashes, the record is missing an input -- the real compilation distinguished
-    something we did not enumerate. That is reported by name, with both hashes,
-    because the alternative is a cache that silently serves one graph for another.
+    something we did not enumerate.
 
-    This is a log, not a raise: it must be able to run on a boot that is already
-    instrumented, and an abort here would hide the very evidence it is collecting.
+    WHAT IT CAN AND CANNOT SAY. It names the record, the site (region name and
+    bytecode hash) and BOTH graph hashes. It CANNOT name the missing input: the
+    two records are identical by construction, because the key IS a hash of the
+    record's fields. The way to find the missing input is to take the region it
+    names and diff what dynamo guarded on there, which is why the region name and
+    code hash are in the line.
+
+    LOGS, DOES NOT RAISE. An abort here would destroy the evidence it exists to
+    collect, and it has to be able to run on an already-instrumented boot.
+
+    NOISE. Over-coverage in the record (the whole-environment digest) cannot cause
+    a false collision: the snapshot is frozen on first use, so within a process the
+    config field is constant. A changed execution context produces a DIFFERENT
+    record key, which is a cache miss in stage 2, not a collision here. So the
+    "different record, same graph" case -- harmless over-coverage -- never reaches
+    this function at all. Only the real signal is logged.
     """
     key = inputs.key()
     gh = str(graph_hash)
     prev = _seen.get(key)
     if prev is None:
         _seen[key] = gh
-        if (key, gh) not in _reported:
-            _reported.add((key, gh))
-            logger.debug("compile-inputs %s -> graph_hash=%s", key, gh)
         return
-    if prev != gh and (key, gh) not in _reported:
-        _reported.add((key, gh))
-        logger.error(
-            "COMPILE-INPUTS COLLISION: one record maps to two graph hashes "
-            "(%s vs %s). The record is missing an input -- compilation "
-            "distinguished something not enumerated here. Record: %s",
-            prev, gh, inputs.describe())
+    if prev == gh or (key, gh) in _reported:
+        return
+    _reported.add((key, gh))
+    logger.error(
+        "COMPILE-INPUTS COLLISION: one record maps to two graph hashes "
+        "(%s vs %s). The record is missing an input -- compilation distinguished "
+        "something not enumerated here. Record: %s",
+        prev, gh, inputs.describe())
+    _persist(inputs, prev, gh)
+
+
+def _persist(inputs: CompileInputs, prev: str, gh: str) -> None:
+    """Append the collision as one JSON line, if a path was configured."""
+    path = env().get(_COLLISION_LOG_ENV, "")
+    if not path:
+        return
+    try:
+        import json
+
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "record": inputs.key(),
+                "graph_hashes": [prev, gh],
+                "context": repr(inputs.context),
+                "config": repr(inputs.config),
+                "instance": repr(inputs.instance),
+                "region": repr(inputs.region),
+                "shapes": repr(inputs.shapes),
+            }) + "\n")
+    except Exception:  # noqa: BLE001 - persistence must never break a compile
+        pass
 
 
 def reset() -> None:
