@@ -60,6 +60,11 @@ struct Entry {
   std::string name;   // the region's name, e.g. "hpu_gdn_pytorch.py:_l2norm_last_dim#a1b2c3d4"
   std::string source; // the source annotation, e.g. "/path/hpu_gdn_pytorch.py:1642"
   uint32_t index{0};  // the `foo.N` ordinal of this recipe within the region
+  // The CompileInputs record key for this graph. Empty when nothing registered
+  // one, which is the honest answer for an eager recipe. When set, THIS is the
+  // recipe cache filename key -- the record is a pure function of the inputs, so
+  // the toolchain does not have to be part of the key.
+  std::string compile_key;
 };
 
 namespace detail {
@@ -110,11 +115,12 @@ inline void note(
     const std::string& graph_name,
     const std::string& name,
     const std::string& source,
-    uint32_t index) {
+    uint32_t index,
+    const std::string& compile_key = {}) {
   if (graph_name.empty()) {
     return;
   }
-  const Entry e{name, source, index};
+  const Entry e{name, source, index, compile_key};
   std::lock_guard<std::mutex> lock(detail::mutex());
   detail::map()[graph_name] = e;
   // Also key it by the frame, because the C++ side that writes the cache entry

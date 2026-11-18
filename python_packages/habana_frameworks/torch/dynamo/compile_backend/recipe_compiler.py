@@ -481,23 +481,6 @@ class HabanaGraphModule(torch.nn.Module):
             # compiled recipe, at compile time, off the launch path.
             launch_ledger.note_recipe(self._recipe_id, self._ledger_handle)
 
-            # Compile-inputs record, built ALONGSIDE the real key. Stage 1: the
-            # graph hash above remains the cache key; this only observes. The
-            # detector in `record()` is the instrument for finding an input we
-            # failed to enumerate, so it has to be wired to the place the recipe
-            # id is known -- otherwise it is dead code that looks like coverage.
-            try:
-                from habana_frameworks.torch.dynamo.compile_backend import (
-                    compile_inputs as _ci,
-                )
-                _ci.record(
-                    _ci.build(instance=(("region", self._name),),
-                              region=(("name", self._name),
-                                      ("code", _ci.region_code(self._name)))),
-                    self._recipe_id)
-            except Exception:  # noqa: BLE001 - instrumentation must never break a compile
-                pass
-
         elif self._has_randoms:
             inputs = (None, None) + inputs
 

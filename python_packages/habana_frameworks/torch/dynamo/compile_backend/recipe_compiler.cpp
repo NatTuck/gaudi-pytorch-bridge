@@ -260,15 +260,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       [](const std::string& graph_name,
          const std::string& name,
          const std::string& source,
-         uint32_t index) {
-        habana::region_identity::note(graph_name, name, source, index);
+         uint32_t index,
+         const std::string& compile_key) {
+        habana::region_identity::note(graph_name, name, source, index, compile_key);
       },
       "Register (graph name -> region name, source file:line, index) so the "
       "identity is written into the recipe cache entry",
       py::arg("graph_name"),
       py::arg("name"),
       py::arg("source"),
-      py::arg("index"));
+      py::arg("index"),
+      py::arg("compile_key") = "");
   m.def(
       "region_identity_count",
       []() { return habana::region_identity::size(); },

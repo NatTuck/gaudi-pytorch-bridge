@@ -13,6 +13,7 @@
  * limitations under the License.
  */
 #include "backend/kernel/hpu_recipe_cache.h"
+#include "backend/synapse_helpers/region_identity_registry.h"
 #include <absl/strings/str_cat.h>
 #include "backend/kernel/hpu_habana_cache.h"
 #include "habana_helpers/misc_utils.h"
@@ -296,15 +297,35 @@ DiskCache::DiskCache(
     : recipe_cache_(recipe_cache_config)
 // TODO: add pytorch version, TICKET SW-62210
 {
-  if (GET_ENV_FLAG_NEW(PT_RECIPE_CACHE_IGNORE_VERSION)) {
-    cache_id_suffix_ = "";
-  } else {
-    constexpr int bufferSize = 256;
-    std::array<char, bufferSize> versionStr;
-    synDriverGetVersion(versionStr.data(), bufferSize);
-    cache_id_suffix_ = absl::StrCat(
-        "_", CacheVersion::libs_env_hash(), "_syn", versionStr.data());
-  }
+  // THE KEY IS hash(CompileInputs) AND NOTHING ELSE.
+  //
+  // The toolchain is deliberately NOT part of it. A bridge rebuild is an
+  // operational event, not an input to compilation, so it does not belong in the
+  // key. `CacheVersion::libs_env_hash()` is gone from the filename for that
+  // reason.
+  //
+  // The safety net for a rebuild that genuinely lowers differently: the record is
+  // unchanged but the graph hash differs, and the compile-inputs detector (which
+  // aborts on a record mapping to two graph hashes) fails the boot and names the
+  // region. That is a controlled, named failure instead of a blanket invalidation.
+  //
+  // OPERATIONAL CONSEQUENCE -- procedure, not key logic: if the detector fires
+  // after a rebuild, clear the cache and re-warm. Someone does that deliberately.
+  //
+  // NOTHING of the toolchain is in the key -- not the library hash, not the
+  // Synapse driver version. A different compiler CAN lower differently, but that
+  // is an operational event, not an input to compilation, so it does not rename
+  // anything.
+  //
+  // THE CONTRACT (PROTOCOL §11): key = actual inputs. Changing code that alters
+  // lowering means clearing the cache, or the affected entries, BY HAND. There is
+  // deliberately no automatic response -- no clearing, no eviction, no version
+  // check -- because an automatic response would hide the one signal that the
+  // lowering changed.
+  //
+  // `PT_RECIPE_CACHE_IGNORE_VERSION` is removed rather than refused: its only
+  // effect was to drop a component that no longer exists.
+  cache_id_suffix_ = "";
 }
 
 void DiskCache::Add(
@@ -313,7 +334,22 @@ void DiskCache::Add(
 {
   std::stringstream ss;
   val.Serialize(ss);
-  auto hashCode = std::to_string(argSpec.hashCode());
+  // THE KEY IS hash(CompileInputs) AND NOTHING ELSE. When a record was registered
+  // for this graph, its key is the filename key. Otherwise fall back to the graph
+  // hash, which is what an eager recipe (no Region) gets.
+  //
+  // The graph hash is NOT discarded: it is still serialised into the recipe's
+  // `.metadata` (RecipeArgumentSpec::Serialize), because it is the collision
+  // detector's only input and the way a record that maps to two graphs is caught.
+  size_t key_hash = argSpec.hashCode();
+  if (val.rl_ && val.rl_->recipe_) {
+    habana::region_identity::Entry entry;
+    if (habana::region_identity::lookup(val.rl_->recipe_->recipe_name_, entry) &&
+        !entry.compile_key.empty()) {
+      key_hash = std::hash<std::string>{}(entry.compile_key);
+    }
+  }
+  auto hashCode = std::to_string(key_hash);
   recipe_cache_.store(hashCode + cache_id_suffix_, val.rl_->recipe_, ss);
   if (val.rl_->recipe_ && !val.rl_->recipe_->recipe_name_.empty()) {
     PT_BRIDGE_DEBUG(

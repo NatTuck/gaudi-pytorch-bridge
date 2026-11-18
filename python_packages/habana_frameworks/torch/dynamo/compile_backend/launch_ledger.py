@@ -325,12 +325,34 @@ def record_partition(graph_name: str, gm) -> "Handle | None":
         index = len(reg.parts)
         reg.parts.append((None, gm))
     ident = _partition_identity(gm, index)
+    # Warmup-item logging: report the identity THIS graph actually received, or
+    # NONE. This is the only place that has both the graph name and the computed
+    # identity, so `identity=NONE` in the log is a fact about this graph rather
+    # than an inference from its absence.
+    try:
+        from vllm_gaudi.v1.worker import warmup_item_log as _wil  # noqa: PLC0415
+
+        if _wil.enabled():
+            _wil.note_graph(graph_name, ident[0] if ident else None,
+                            ident[1] if ident else None)
+    except Exception:  # noqa: BLE001 - logging must never break a compile
+        pass
     if ident is not None:
         name, source, idx = ident
         try:
             from ._recipe_compiler_C import note_region  # noqa: PLC0415
+            from . import compile_inputs as _ci  # noqa: PLC0415
 
-            note_region(graph_name, name, source, idx)
+            # The record key travels WITH the identity. The bridge uses it as the
+            # recipe cache filename key, so the key is a pure function of the
+            # actual inputs and the toolchain is not part of it. If this raises,
+            # the bridge falls back to the graph hash, which is the documented
+            # fallback and still correct within a process.
+            _key = _ci.build(
+                instance=(("region", name),),
+                region=(("name", name), ("code", _ci.region_code(name))),
+            ).key()
+            note_region(graph_name, name, source, idx, _key)
         except Exception as exc:  # noqa: BLE001
             _warn_once("cannot register the region identity", f"{graph_name}: {exc!r}")
     return Handle(graph_name, index)

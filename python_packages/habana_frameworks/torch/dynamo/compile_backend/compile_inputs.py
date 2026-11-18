@@ -26,11 +26,18 @@ change -- `libs_env_hash`, `PT_RECIPE_CACHE_IGNORE_VERSION`, the shape-inference
 flags, `unique_graph_cntr` and `op_strs` are all inside the C++ bridge and cannot
 be supplied from here.
 
-## The collision detector is the point
+## What there is NOT
 
-We will have missed something. The detector is the mechanism that finds it: if one
-computed record ever maps to two different graph hashes, then the record is missing
-an input, and it names the record and both hashes rather than failing quietly.
+There is no collision detector. One existed and was removed: it ran only after
+`graph_compile`, so it covered the cold path and was blind on the warm path --
+which is the case that matters, because a warm boot loads the recipe from disk and
+never recompiles. A check that protects the rare path while appearing to protect
+the common one is worse than none, because it invites trust.
+
+THE CONTRACT (PROTOCOL §11): key = actual inputs. If you change code that alters
+lowering, CLEAR THE CACHE -- or the affected entries -- BY HAND. Nothing here does
+that automatically, deliberately: an automatic response would hide the signal that
+the lowering changed.
 """
 from __future__ import annotations
 
@@ -42,6 +49,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 logger = logging.getLogger(__name__)
+
 
 # Flags that change the lowered graph. Read ONCE, at snapshot time.
 _CONFIG_FLAGS = (
@@ -191,8 +199,13 @@ def build(*, instance: tuple = (), region: tuple = (), shapes: tuple = ()) -> Co
     snap = env()
     threads, dtype = _thread_and_dtype()
     context = (exec_context()[0], exec_context()[1], threads, dtype)
-    config = tuple((name, flag(name)) for name in _CONFIG_FLAGS) + (
-        ("env_digest", _env_digest(snap)),)
+    # ENUMERATED CONFIG FLAGS ONLY. An earlier version folded in a digest of the
+    # whole environment as deliberate over-coverage; that was wrong under the
+    # principle that the key depends only on the actual inputs, because it made an
+    # unrelated variable change produce a spurious miss. The detector covers the
+    # unenumerated case better anyway -- it compares GRAPH HASHES rather than
+    # hoping a digest moved.
+    config = tuple((name, flag(name)) for name in _CONFIG_FLAGS)
     return CompileInputs(
         context=context,
         config=config,
@@ -202,97 +215,4 @@ def build(*, instance: tuple = (), region: tuple = (), shapes: tuple = ()) -> Co
     )
 
 
-# ---------------------------------------------------------------------------
-# Collision detector
-# ---------------------------------------------------------------------------
 
-_seen: dict[str, str] = {}
-_reported: set[tuple[str, str]] = set()
-# Region name -> bytecode hash, registered where the function object exists (the
-# `Region` wrapper) and looked up here where only the name exists (the launcher).
-_region_code: dict[str, str] = {}
-# Persistence. A collision that fires once and scrolls away is not evidence, so
-# when this path is set every collision is appended as one JSON line and survives
-# teardown. Read from the frozen snapshot, not from live env.
-_COLLISION_LOG_ENV = "PT_HPU_COMPILE_INPUTS_LOG"
-
-
-def register_region_code(name: str, fn: Any) -> None:
-    """Record a region's bytecode hash. Called by `Region.__init__`."""
-    try:
-        _region_code[name] = code_hash(fn)
-    except Exception:  # noqa: BLE001 - instrumentation must never break a region
-        pass
-
-
-def region_code(name: str) -> str:
-    return _region_code.get(name, "unknown")
-
-
-def record(inputs: CompileInputs, graph_hash: Any) -> None:
-    """Compare one computed record against the real graph hash.
-
-    THE DISCOVERY MECHANISM. If a single record maps to two different graph
-    hashes, the record is missing an input -- the real compilation distinguished
-    something we did not enumerate.
-
-    WHAT IT CAN AND CANNOT SAY. It names the record, the site (region name and
-    bytecode hash) and BOTH graph hashes. It CANNOT name the missing input: the
-    two records are identical by construction, because the key IS a hash of the
-    record's fields. The way to find the missing input is to take the region it
-    names and diff what dynamo guarded on there, which is why the region name and
-    code hash are in the line.
-
-    LOGS, DOES NOT RAISE. An abort here would destroy the evidence it exists to
-    collect, and it has to be able to run on an already-instrumented boot.
-
-    NOISE. Over-coverage in the record (the whole-environment digest) cannot cause
-    a false collision: the snapshot is frozen on first use, so within a process the
-    config field is constant. A changed execution context produces a DIFFERENT
-    record key, which is a cache miss in stage 2, not a collision here. So the
-    "different record, same graph" case -- harmless over-coverage -- never reaches
-    this function at all. Only the real signal is logged.
-    """
-    key = inputs.key()
-    gh = str(graph_hash)
-    prev = _seen.get(key)
-    if prev is None:
-        _seen[key] = gh
-        return
-    if prev == gh or (key, gh) in _reported:
-        return
-    _reported.add((key, gh))
-    logger.error(
-        "COMPILE-INPUTS COLLISION: record %s maps to two graph hashes "
-        "(%s vs %s). The record is missing an input -- compilation distinguished "
-        "something not enumerated here. Record: %s",
-        key, prev, gh, inputs.describe())
-    _persist(inputs, prev, gh)
-
-
-def _persist(inputs: CompileInputs, prev: str, gh: str) -> None:
-    """Append the collision as one JSON line, if a path was configured."""
-    path = env().get(_COLLISION_LOG_ENV, "")
-    if not path:
-        return
-    try:
-        import json
-
-        with open(path, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({
-                "record": inputs.key(),
-                "graph_hashes": [prev, gh],
-                "context": repr(inputs.context),
-                "config": repr(inputs.config),
-                "instance": repr(inputs.instance),
-                "region": repr(inputs.region),
-                "shapes": repr(inputs.shapes),
-            }) + "\n")
-    except Exception:  # noqa: BLE001 - persistence must never break a compile
-        pass
-
-
-def reset() -> None:
-    """Drop the detector's memory. Test seam; not used on the serving path."""
-    _seen.clear()
-    _reported.clear()
