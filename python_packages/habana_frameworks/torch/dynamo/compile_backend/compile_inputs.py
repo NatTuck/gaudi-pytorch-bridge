@@ -305,11 +305,27 @@ def _strip_docstrings(node):
 
 
 def _module_functions(tree) -> dict:
-    """Top-level functions in one module, by name."""
+    """Every resolvable callable in one module, by name: top-level AND methods.
+
+    Top-level functions take precedence on a name collision, so the 33 module-level
+    regions resolve exactly as before -- `setdefault` is what preserves that.
+
+    Methods are included because the MODEL FORWARD is a method, not a module-level
+    function. `code_identity` could not see it, and that blocked keying the model
+    forward at `hpu_model_runner.py:1791`. The walk below is the same one; it just
+    descends one level into class bodies.
+    """
     import ast
 
-    return {n.name: n for n in tree.body
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    out = {n.name: n for n in tree.body
+           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for sub in node.body:
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.setdefault(sub.name, sub)
+    return out
 
 
 def _names_used(node) -> set:
@@ -321,6 +337,10 @@ def _names_used(node) -> set:
         if isinstance(child, ast.Name):
             out.add(child.id)
         elif isinstance(child, ast.Attribute):
+            # The ATTRIBUTE NAME is the callee for `self.helper(x)`; collecting
+            # only the base would record `self` and miss every method-to-method
+            # call, which is precisely how the model forward calls its helpers.
+            out.add(child.attr)
             base = child
             while isinstance(base, ast.Attribute):
                 base = base.value
@@ -392,9 +412,8 @@ def code_identity(fn) -> str:
     entries = _closure(path, name)
     if not entries:
         raise UnnamedCompile(
-            f"cannot resolve code identity for {qualname} at {path}: no module-level "
-            f"function named {name!r} was found. If the region wraps a method, wrap "
-            f"the module-level function it calls instead.")
+            f"cannot resolve code identity for {qualname} at {path}: no function or "
+            f"method named {name!r} was found in that module.")
 
     h = hashlib.blake2b(digest_size=16)
     for entry_name, node in entries:
