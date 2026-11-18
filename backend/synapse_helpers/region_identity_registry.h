@@ -105,19 +105,27 @@ inline std::string frame_key(const std::string& s) {
   //   "the compile key for graph '.graph_dumps/graph_0112_fused_0_...' is empty"
   //
   // The two names share the `graph_<digits>` token; that is the whole join.
-  const size_t start = s.find(kPrefix);
-  if (start == std::string::npos) {
-    return {};
+  // ITERATE OCCURRENCES, not just the first. `.graph_dumps` CONTAINS `graph_`,
+  // so `find` alone lands on it:
+  //
+  //   . g r a p h _ d u m p s / g r a p h _ 0 1 1 1
+  //   0 1 2 3 4 5 6 7 ...
+  //
+  // index 1 is "graph_", followed by 'd' -- not a digit -- so a single `find`
+  // returns {} for every real name. The prefix must be followed by DIGITS.
+  size_t pos = 0;
+  while ((pos = s.find(kPrefix, pos)) != std::string::npos) {
+    size_t i = pos + kPrefixLen;
+    size_t end = i;
+    while (end < s.size() && s[end] >= '0' && s[end] <= '9') {
+      ++end;
+    }
+    if (end > i) {
+      return s.substr(pos, end - pos);  // graph_<digits>
+    }
+    ++pos;
   }
-  size_t i = start + kPrefixLen;
-  size_t end = i;
-  while (end < s.size() && s[end] >= '0' && s[end] <= '9') {
-    ++end;
-  }
-  if (end == i) {
-    return {};
-  }
-  return s.substr(start, end - start);
+  return {};
 }
 
 } // namespace detail
