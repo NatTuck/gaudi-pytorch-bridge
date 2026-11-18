@@ -265,7 +265,8 @@ def _region_hint() -> str:
         getter = getattr(_ll, "_declared_stack", None)
         stack = getter() if getter is not None else None
         if stack:
-            name, file, line = stack[-1]
+            _e = stack[-1]
+            name, file, line = _e[0], _e[1], _e[2]
             return f" region={name} source={file}:{line}"
     except Exception:  # noqa: BLE001 - diagnostics must never break a compile
         pass

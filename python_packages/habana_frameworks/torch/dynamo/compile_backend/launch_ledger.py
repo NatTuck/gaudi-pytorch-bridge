@@ -103,7 +103,8 @@ def _declared_stack() -> list:
     return st
 
 
-def set_declared_identity(name: str, file: str | None = None, line: int | None = None):
+def set_declared_identity(name: str, file: str | None = None, line: int | None = None,
+                          compile_key: str = ""):
     """Declare the identity of the region being compiled on this thread.
 
     Called by ``vllm_gaudi.device_regions.Region`` immediately before it compiles
@@ -111,8 +112,22 @@ def set_declared_identity(name: str, file: str | None = None, line: int | None =
     definition site, which is the region's real source position. Returns a token
     to pass to :func:`clear_declared_identity`.
     """
-    _declared_stack().append((name, file, line))
+    _declared_stack().append((name, file, line, compile_key))
     return _declared_stack()[-1]
+
+
+def declared_compile_key() -> str:
+    """The CompileInputs key published by the region currently running.
+
+    Same channel as the declared identity -- a per-thread stack -- so there is ONE
+    way for a key to reach the backend. Returns "" when nothing was published,
+    which makes the store side fail loudly rather than fall back.
+    """
+    st = _declared_stack()
+    if not st:
+        return ""
+    entry = st[-1]
+    return entry[3] if len(entry) > 3 else ""
 
 
 def clear_declared_identity(token) -> None:
@@ -356,7 +371,7 @@ def record_partition(graph_name: str, gm) -> "Handle | None":
         from ._recipe_compiler_C import note_region  # noqa: PLC0415
         from . import compile_inputs as _ci  # noqa: PLC0415
 
-        _key = _ci.key_for_region(name)
+        _key = declared_compile_key()
         note_region(graph_name, name, source, idx, _key)
     return Handle(graph_name, index)
 
