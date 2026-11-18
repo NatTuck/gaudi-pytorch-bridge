@@ -94,17 +94,30 @@ inline std::mutex& mutex() {
 inline std::string frame_key(const std::string& s) {
   constexpr const char* kPrefix = "graph_";
   constexpr size_t kPrefixLen = 6;
-  if (s.size() <= kPrefixLen || s.compare(0, kPrefixLen, kPrefix) != 0) {
+  // FIND THE PREFIX ANYWHERE, not only at position 0.
+  //
+  // `DiskCache::Add` looks up with the SYNAPSE recipe name, which is
+  // `.graph_dumps/graph_0112_fused_0_syn_1112000_1112000_140`. A prefix-only test
+  // returned {} for it, so the frame-key fallback never ran, the direct lookup
+  // missed (the registry holds the DYNAMO name, `graph_0112_base_fx`), and every
+  // store saw an empty key:
+  //
+  //   "the compile key for graph '.graph_dumps/graph_0112_fused_0_...' is empty"
+  //
+  // The two names share the `graph_<digits>` token; that is the whole join.
+  const size_t start = s.find(kPrefix);
+  if (start == std::string::npos) {
     return {};
   }
-  size_t i = kPrefixLen;
-  while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
-    ++i;
+  size_t i = start + kPrefixLen;
+  size_t end = i;
+  while (end < s.size() && s[end] >= '0' && s[end] <= '9') {
+    ++end;
   }
-  if (i == kPrefixLen) {
+  if (end == i) {
     return {};
   }
-  return s.substr(0, i);
+  return s.substr(start, end - start);
 }
 
 } // namespace detail
