@@ -199,7 +199,16 @@ def build(*, instance: tuple = (), region: tuple = (), shapes: tuple = ()) -> Co
     # unrelated variable change produce a spurious miss. The detector covers the
     # unenumerated case better anyway -- it compares GRAPH HASHES rather than
     # hoping a digest moved.
-    config = tuple((name, flag(name)) for name in _CONFIG_FLAGS)
+    config = tuple((name, flag(name)) for name in _CONFIG_FLAGS) + (
+        # Toolchain identity. Not traced into, so its identity has to come from a
+        # version or a source hash -- otherwise a change that alters the lowered
+        # graph is invisible. `bridge_source` is a SOURCE hash by ruling, not a
+        # `.so` hash: the bridge is our code, so a source change invalidates and a
+        # rebuild with no source change does not.
+        ("torch_version", _torch_version()),
+        ("synapse_version", _synapse_version()),
+        ("bridge_source", _bridge_source()),
+    )
     return CompileInputs(
         context=context,
         config=config,
@@ -415,6 +424,102 @@ def register_region_code(name: str, fn: Any) -> None:
 
 def region_code(name: str) -> str:
     return _region_code.get(name, "unknown")
+
+
+def key_for_region(name: str) -> str:
+    """The recipe cache key for a region: hash of every DECLARED input.
+
+        hash( code_identity, shapes, ints, context, config,
+              torch_version, synapse_version, bridge_source )
+
+    `code_identity` arrives through `region`, which is populated by
+    `register_region_code` from the region's AST closure. Shapes and ints are the
+    `shapes` field. Context and config come from the frozen snapshot.
+
+    NOT in the key, deliberately: `libs_env_hash()`, `.so` content, and anything
+    graph-derived (`op_strs`, topology, the graph hash) -- those are computed AFTER
+    tracing, and keying on them would make the key uncomputable without tracing,
+    which is the thing this work removes.
+    """
+    return build(
+        instance=(("region", name),),
+        region=(("name", name), ("code", region_code(name))),
+    ).key()
+
+
+def _torch_version() -> str:
+    import torch
+
+    return str(torch.__version__)
+
+
+def _synapse_version() -> str:
+    """The Synapse/Habana toolchain version.
+
+    IN THE KEY because we do not trace into Synapse: its identity has to come from
+    its version, or a change that alters the lowered graph is invisible.
+
+    RAISES when it cannot be determined. Recording "unknown" would mean two
+    different toolchains produce the same key and nothing would notice -- the same
+    silent fallback this module exists to remove.
+    """
+    try:
+        import habana_frameworks.torch as _htorch
+
+        # `habana_frameworks.torch.__version__` is the Synapse/Habana stack
+        # version (e.g. "1.24.2.481"). The TOP-LEVEL `habana_frameworks` package
+        # carries no `__version__` -- verified, not assumed.
+        version = getattr(_htorch, "__version__", None)
+        if version:
+            return str(version)
+    except Exception as exc:  # noqa: BLE001 - re-raised below with context
+        raise RuntimeError(
+            f"cannot determine the Synapse version for the recipe key: {exc!r}. "
+            "It is an input to the key, so it must not be guessed.") from exc
+    raise RuntimeError(
+        "cannot determine the Synapse version for the recipe key: "
+        "habana_frameworks.torch.__version__ is absent. It is an input to the key, "
+        "so it must not be guessed.")
+
+
+# Bridge Python whose source participates in the key (see `_bridge_source`).
+_BRIDGE_LOWERING_SOURCES = ("passes.py", "compilers.py", "partition_fn.py",
+                            "recipe_compiler.py")
+_bridge_source_cache: str | None = None
+
+
+def _bridge_source() -> str:
+    """A hash of the lowering-path bridge SOURCE.
+
+    RULING, FLAGGED FOR OVERRULE: the bridge contributes a hash of its source, not
+    of its `.so` content. The bridge is our code, so it is traced like the rest: a
+    source change invalidates, and a rebuild with no source change does not.
+
+    Cached: the files do not change within a process, and this runs per compile.
+    """
+    global _bridge_source_cache
+    if _bridge_source_cache is not None:
+        return _bridge_source_cache
+    h = hashlib.blake2b(digest_size=16)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in _BRIDGE_LOWERING_SOURCES:
+        path = os.path.join(here, name)
+        try:
+            with open(path, "rb") as stream:
+                h.update(stream.read())
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot hash the bridge lowering source {path!r}: {exc}. It is an "
+                f"input to the recipe key, so it must not be skipped.") from exc
+        h.update(b"\0")
+    _bridge_source_cache = h.hexdigest()
+    return _bridge_source_cache
+
+
+def reset_bridge_source_cache() -> None:
+    """Test seam."""
+    global _bridge_source_cache
+    _bridge_source_cache = None
 
 
 class UnnamedCompile(RuntimeError):

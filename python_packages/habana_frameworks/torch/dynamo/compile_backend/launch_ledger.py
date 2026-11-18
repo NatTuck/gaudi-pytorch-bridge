@@ -339,22 +339,25 @@ def record_partition(graph_name: str, gm) -> "Handle | None":
         pass
     if ident is not None:
         name, source, idx = ident
-        try:
-            from ._recipe_compiler_C import note_region  # noqa: PLC0415
-            from . import compile_inputs as _ci  # noqa: PLC0415
+        # NO try/except HERE, DELIBERATELY.
+        #
+        # This block used to catch everything and downgrade it to a one-time
+        # warning. When the compile-inputs detector was removed, that took
+        # `register_region_code` with it, `region_code()` stopped existing, the
+        # NameError was caught here, and the recipe key silently fell back to the
+        # graph hash -- the exact failure this design exists to remove, hidden by a
+        # bare `except`, introduced by the commit that removed the detector.
+        #
+        # A failure to resolve identity is a HARD FAILURE. `UnnamedCompile`
+        # propagates; a missing binding propagates; there is no fallback to the
+        # graph hash, because a fallback would keep working while keyed on
+        # something explicitly ruled out and nobody would know which compiles were
+        # doing it.
+        from ._recipe_compiler_C import note_region  # noqa: PLC0415
+        from . import compile_inputs as _ci  # noqa: PLC0415
 
-            # The record key travels WITH the identity. The bridge uses it as the
-            # recipe cache filename key, so the key is a pure function of the
-            # actual inputs and the toolchain is not part of it. If this raises,
-            # the bridge falls back to the graph hash, which is the documented
-            # fallback and still correct within a process.
-            _key = _ci.build(
-                instance=(("region", name),),
-                region=(("name", name), ("code", _ci.region_code(name))),
-            ).key()
-            note_region(graph_name, name, source, idx, _key)
-        except Exception as exc:  # noqa: BLE001
-            _warn_once("cannot register the region identity", f"{graph_name}: {exc!r}")
+        _key = _ci.key_for_region(name)
+        note_region(graph_name, name, source, idx, _key)
     return Handle(graph_name, index)
 
 
