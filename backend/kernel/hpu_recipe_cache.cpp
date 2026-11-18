@@ -341,14 +341,29 @@ void DiskCache::Add(
   // The graph hash is NOT discarded: it is still serialised into the recipe's
   // `.metadata` (RecipeArgumentSpec::Serialize), because it is the collision
   // detector's only input and the way a record that maps to two graphs is caught.
-  size_t key_hash = argSpec.hashCode();
-  if (val.rl_ && val.rl_->recipe_) {
-    habana::region_identity::Entry entry;
-    if (habana::region_identity::lookup(val.rl_->recipe_->recipe_name_, entry) &&
-        !entry.compile_key.empty()) {
-      key_hash = std::hash<std::string>{}(entry.compile_key);
-    }
-  }
+  // NO FALLBACK. An unresolvable identity at the compile entry is a HARD FAILURE.
+  //
+  // The graph-hash fallback was explicitly ruled out: it would keep working while
+  // keyed on something that cannot be computed without tracing -- the thing this
+  // work removes -- and nobody would know which compiles were doing it. Raising is
+  // also the completeness instrument: the first boot reports the true population of
+  // compiled regions instead of silently keying some of them on the graph.
+  TORCH_CHECK(val.rl_ != nullptr && val.rl_->recipe_ != nullptr,
+              "recipe cache key: this entry has no recipe, so there is no graph "
+              "name to resolve a code identity against.");
+  habana::region_identity::Entry entry;
+  TORCH_CHECK(habana::region_identity::lookup(val.rl_->recipe_->recipe_name_, entry),
+              "recipe cache key: NO code identity is registered for graph '",
+              val.rl_->recipe_->recipe_name_,
+              "'. Every compiled graph must go through a Region (or the compile "
+              "entry must register one) so its key is a function of its inputs. "
+              "There is deliberately no fallback to the graph hash.");
+  TORCH_CHECK(!entry.compile_key.empty(),
+              "recipe cache key: the identity registered for graph '",
+              val.rl_->recipe_->recipe_name_,
+              "' carries no compile key. Register one via note_region(..., "
+              "compile_key) before the graph compiles.");
+  size_t key_hash = std::hash<std::string>{}(entry.compile_key);
   auto hashCode = std::to_string(key_hash);
   recipe_cache_.store(hashCode + cache_id_suffix_, val.rl_->recipe_, ss);
   if (val.rl_->recipe_ && !val.rl_->recipe_->recipe_name_.empty()) {
