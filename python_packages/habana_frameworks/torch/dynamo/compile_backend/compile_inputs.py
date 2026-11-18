@@ -263,10 +263,10 @@ def record(inputs: CompileInputs, graph_hash: Any) -> None:
         return
     _reported.add((key, gh))
     logger.error(
-        "COMPILE-INPUTS COLLISION: one record maps to two graph hashes "
+        "COMPILE-INPUTS COLLISION: record %s maps to two graph hashes "
         "(%s vs %s). The record is missing an input -- compilation distinguished "
         "something not enumerated here. Record: %s",
-        prev, gh, inputs.describe())
+        key, prev, gh, inputs.describe())
     _persist(inputs, prev, gh)
 
 
