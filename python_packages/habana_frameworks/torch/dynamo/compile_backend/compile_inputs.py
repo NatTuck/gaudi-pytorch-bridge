@@ -540,3 +540,112 @@ class UnnamedCompile(RuntimeError):
     were doing it. Raising also gives the true population of compiled regions on
     the first boot, which closes the "how many are there really" gap.
     """
+
+
+# ---------------------------------------------------------------------------
+# The trace-free record
+# ---------------------------------------------------------------------------
+
+# Module attributes dynamo guards on. Read with getattr, never from a trace.
+_GUARDED_ATTRS = ("_ACTIVE", "_hpu_cache_group_index", "compact_state_group_offset",
+                  "num_query_per_req", "block_size")
+
+
+def _tensor_signature(t):
+    """(shape, dtype, stride) for one tensor, or raise."""
+    try:
+        shape = tuple(int(d) for d in t.shape)
+        dtype = str(t.dtype)
+        stride = tuple(int(s) for s in t.stride())
+    except Exception as exc:  # noqa: BLE001 - re-raised with the tensor named
+        raise RuntimeError(
+            f"cannot read the signature of {t!r} for the compile key: {exc!r}. "
+            f"Shape, dtype and stride are inputs to the key, so they must not be "
+            f"omitted.") from exc
+    return ("tensor", shape, dtype, stride)
+
+
+def _signature_of(value, where: str):
+    """One entry per argument. Tensors give shape/dtype/stride, ints give the value.
+
+    NESTED CONTAINERS ARE FLATTENED. `aux_hidden_states` is a list of five tensors
+    and is one of the regions that matters most; treating a list as opaque would
+    put an empty entry in the key exactly where the specialisation lives.
+    """
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return [_tensor_signature(value)]
+    if isinstance(value, bool):
+        return [("bool", value)]
+    if isinstance(value, int):
+        return [("int", value)]
+    if isinstance(value, (list, tuple)):
+        out = []
+        for i, item in enumerate(value):
+            out.extend(_signature_of(item, f"{where}[{i}]"))
+        return out
+    if isinstance(value, dict):
+        out = []
+        for k in sorted(value, key=repr):
+            out.extend(_signature_of(value[k], f"{where}[{k!r}]"))
+        return out
+    # Anything else cannot be a compilation input we understand.
+    raise RuntimeError(
+        f"cannot key on argument {where} of type {type(value).__name__}. Only "
+        f"tensors, ints, bools and containers of those are declared inputs; "
+        f"silently dropping this argument would produce a key that omits it.")
+
+
+def _instance_attributes(module) -> tuple:
+    """The dynamo-guarded attributes, read off the module object.
+
+    `getattr` on the object is exactly what dynamo guards; nothing here needs a
+    trace. An attribute that is ABSENT is recorded as absent, which is itself a
+    guarded fact -- `KeyError on self._modules['linear_attn']` is a real guard we
+    have seen fire.
+    """
+    out = []
+    if module is None:
+        return ()
+    for name in _GUARDED_ATTRS:
+        out.append((name, getattr(module, name, "<absent>")))
+    # Module presence: the linear/full attention split is a real graph difference.
+    mods = getattr(module, "_modules", None)
+    if isinstance(mods, dict):
+        out.append(("__modules__", tuple(sorted(mods))))
+    layers = getattr(module, "_layers", None)
+    if layers is not None:
+        try:
+            out.append(("len(_layers)", len(layers)))
+        except TypeError:
+            out.append(("len(_layers)", "<unlenable>"))
+    return tuple(out)
+
+
+def make_record(fn, args, kwargs, module) -> CompileInputs:
+    """The record, built from what the CALLER already holds. No trace.
+
+    `args`/`kwargs` are the real call arguments, so the shapes and ints are the
+    ones the compile will actually see. `module` supplies the guarded attributes.
+
+    Uses `build()`, whose inputs are all required -- so a field that cannot be
+    produced raises here rather than silently weakening the key.
+    """
+    shapes = []
+    for i, a in enumerate(args):
+        shapes.extend(_signature_of(a, f"args[{i}]"))
+    for k in sorted(kwargs, key=repr):
+        shapes.extend(_signature_of(kwargs[k], f"kwargs[{k!r}]"))
+    name = getattr(fn, "__qualname__", repr(fn))
+    # SAME ACCESSOR AS `key_for_region`: the registry, populated by
+    # `register_region_code`. One way to obtain the code identity, so the store
+    # path and the warm path cannot diverge on it.
+    code = region_code(name)
+    if code == "unknown":
+        code = code_identity(fn)
+    return build(
+        instance=_instance_attributes(module),
+        region=(("name", name), ("code", code)),
+        shapes=tuple(shapes),
+    )
