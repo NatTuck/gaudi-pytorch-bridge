@@ -947,8 +947,29 @@ class HabanaLaunchOpPT {
 
   std::shared_ptr<RecipeHolder> GetCachedRecipe(
       std::shared_ptr<RecipeArgumentSpec>& spec_key) {
-    auto rh{HPUDeviceContext::recipe_cache().get(spec_key,
-                                                 CompileKeyForCache())};
+    // ONE COMPUTATION, and now it is also logged.
+    //
+    // A collision is a key that TWO DIFFERENT GRAPHS both computed. The only way
+    // to see one is to print the key beside the graph that asked for it, because
+    // `DiskCache::Add` prints the same pair (`Storing in disc cache: recipe:key:
+    // <name>:<key>`). Store and load lines then line up by key, and a key that
+    // appears with two different graph names is the collision, named.
+    //
+    // `Find` itself cannot log this: it receives the key and nothing else, so it
+    // does not know which graph is asking. Here both are in scope.
+    //
+    // Enable by raising the hl_logger level for this module: `LOG_LEVEL_PT_BRIDGE=1`
+    // (HLLOG_LEVEL_DEBUG) or `LOG_LEVEL_ALL_DBG=1` for every module. The gate is
+    // `hl_logger::logLevelAtLeast(PT_BRIDGE, HLLOG_LEVEL_DEBUG)` -- there is no
+    // simple boolean, because these lines are per-compile and would flood a boot.
+    const std::string compile_key = CompileKeyForCache();
+    auto rh{HPUDeviceContext::recipe_cache().get(spec_key, compile_key)};
+    PT_BRIDGE_DEBUG("recipe cache lookup: graph=",
+                    syn_graph_name_,
+                    " key=",
+                    compile_key,
+                    " -> ",
+                    (nullptr != rh ? "HIT" : "MISS"));
     if (nullptr != rh && nullptr == rh->rvs_->jit_graph_) {
       rh->rvs_->jit_graph_ = jit_ir_graph_;
     }
