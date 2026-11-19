@@ -1090,6 +1090,198 @@ def _preload_refusal(cache_dir: str, frame_key: str, inputs: tuple):
     return None
 
 
+# ---------------------------------------------------------------------------
+# CAPTURE -- record what a region call was ACTUALLY called with.
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS, MEASURED. The explicit warm mints the regions in
+# `vllm_gaudi/v1/spec_decode/spec_launch_regions.py` at shapes it READS FROM THE
+# CONFIGURATION, and boot-b8.log shows that this covers 21 of them and leaves the
+# rest to compile at serving:
+#
+#   hpu_dflash2:_combine_aux_hidden_states   64 misses (recipe records 6 input
+#                                            slots, the call supplies 7)
+#   prefix_state_cache:_index_copy_rows      40 misses (recipe records one shape
+#                                            list, the call supplies
+#                                            [162,48,128,128] / [162,10,10240])
+#   prefix_state_cache:_zeros_rows           10 misses (recipe records 0 slots,
+#                                            the call supplies 1)
+#   extension.ops:_dynamic_quant_naive        4 misses, never warmed
+#   device_regions:_zeros_like                1 miss,  never warmed
+#   spec_launch_regions:_scatter_draft_rows   2 misses at arities 7 and 14
+#   model.forward                             1 miss,  never warmed
+#   Qwen3NextDecoderLayer.forward             9 compiles at serving shapes
+#
+# Every one of those is a call the WARM does not make, at arguments the warm
+# cannot know. The arity mismatches above are the same defect seen from the other
+# side: the warm traced a recipe with the wrong number of inputs, so even the
+# region it did warm could not be loaded at serving.
+#
+# The cure is not a better guess. It is to let a real serving run say what it
+# called, and let the next boot's warm call exactly that.
+#
+# THE RECORD IS THE SIGNATURE THE KEY USES. `_signature_of` normalises one
+# argument into the entries the key is built from, and that is what is written
+# here -- so a call rebuilt from this file is INDISTINGUISHABLE from the recorded
+# one: `make_record` over the rebuilt arguments produces the same `shapes` field
+# and therefore the same key. A second normaliser here would eventually disagree
+# with the key about the same call, and the disagreement would be a warm that
+# looks like it worked.
+#
+# ONE LINE PER CALL, APPENDED ATOMICALLY:
+#
+#   {"region": "<name as the consult knows it>",
+#    "args":   [<signature of arg 0>, <signature of arg 1>, ...],
+#    "kinds":  ["scalar" | "list" | "dict" | "nested", ...],
+#    "kwargs": {"<name>": <signature>},      # only when the call had keywords
+#    "kwkinds": {"<name>": "<kind>"}}
+#
+# `args` is PER ARGUMENT, not the flat concatenation `make_record` builds: the
+# argument BOUNDARY has to survive, or the replay cannot know whether a run of
+# six tensor entries was one list of six or six separate arguments -- which is
+# precisely `_combine_aux_hidden_states` (a list of six aux states plus one index
+# tensor) versus `_index_copy_rows` (four separate tensors).
+#
+# `kinds` is what the flattening loses about the CONTAINER, recorded so the replay
+# does not have to guess it back:
+#   scalar -- not a container; exactly one signature entry
+#   list   -- a flat list/tuple; one entry per element, rebuilt as a list
+#   dict   -- a dict; `_signature_of` sorts by `repr(key)` and DROPS the keys, so
+#             it cannot be rebuilt and the replay refuses it by name
+#   nested -- a container inside a container; the flattening erases the grouping
+#             and the replay refuses it by name rather than guessing
+# The last two do not occur in this region set (every container argument is a flat
+# list of tensors, or a flat tuple of ints for `torch.full`'s shape). They are
+# recorded anyway, because "does not occur today" is not a property a reader can
+# check, and a refusal that names its reason is worth more than a silent guess.
+#
+# COST WHEN OFF: one `is None` test on the consult path. Nothing is computed, no
+# descriptor is opened, and the file this module writes is never created.
+
+#: Where captured calls are appended, from `VLLM_WARM_CAPTURE`. Read ONCE, at
+#: import, like every other ambient flag this module reads (`_GATE`).
+_CAPTURE_PATH = os.environ.get("VLLM_WARM_CAPTURE", "").strip() or None
+
+#: The append-only descriptor. Opened lazily on the first captured call and never
+#: closed: a capture file is written by whichever thread calls a region, and for
+#: weight loading that thread is not the one that would own a `with` block.
+_CAPTURE_FD: "int | None" = None
+
+#: Set when the capture file cannot be written. Capture is a diagnostic, so a
+#: write fault must not kill the boot -- but it must not be silent either, or a
+#: boot that recorded nothing looks exactly like one that recorded everything.
+_CAPTURE_BROKEN = False
+
+#: Serialises the lazy open and the single `write` per line. The lowering thread
+#: and the calling thread differ, so this is required rather than decorative;
+#: `O_APPEND` covers the cross-PROCESS case, which this lock cannot.
+_CAPTURE_LOCK = threading.Lock()
+
+
+def capture_path() -> "str | None":
+    """The capture file this process appends to, or None. Read-only."""
+    return _CAPTURE_PATH
+
+
+def set_capture_path(path: "str | None") -> "str | None":
+    """Point capture at `path` (None to stop capturing). Returns the previous path.
+
+    The supported seam. The warm REPLAY uses it to switch capture off for the
+    duration of a replay: a replayed call is not a serving call, so recording it
+    would put the warm's own guesses into the file a later warm replays -- and
+    would make the replay read the lines it was writing.
+    """
+    global _CAPTURE_PATH
+    previous = _CAPTURE_PATH
+    _CAPTURE_PATH = (path or None)
+    return previous
+
+
+def _container_kind(value) -> str:
+    """What `_signature_of` did to this argument's container, as a word.
+
+    Only what the REPLAY needs to know and cannot recover from the flattened
+    entries: whether the argument was not a container, a flat one, or one whose
+    structure the flattening destroyed. See the block comment above.
+    """
+    if isinstance(value, dict):
+        return "dict"
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, (list, tuple, dict)):
+                return "nested"
+        return "list"
+    return "scalar"
+
+
+def _capture_off(reason: str) -> None:
+    """Stop capturing, and say why. Never raises."""
+    global _CAPTURE_BROKEN
+    _CAPTURE_BROKEN = True
+    logger.error(
+        "recipe consult: CAPTURE DISABLED for this process (%s). The capture file "
+        "%r will not be written again, so any warm replayed from it is INCOMPLETE. "
+        "The region calls themselves are unaffected.", reason, _CAPTURE_PATH)
+
+
+def _capture_call(region_name: str, args: tuple, kwargs: dict) -> None:
+    """Append one line describing this call. Called ONLY when capturing.
+
+    A fault here is logged and turns capture off; it never reaches the region
+    call. That is the same rule the bundle recorder follows, for the same reason:
+    a diagnostic must not be able to kill a boot.
+    """
+    global _CAPTURE_FD
+    if _CAPTURE_BROKEN:
+        return
+    try:
+        from . import compile_inputs  # noqa: PLC0415 - same lazy import the key uses
+
+        record = {
+            "region": region_name,
+            # PER ARGUMENT. `_signature_of` returns a LIST of entries for one
+            # value, so this is one normalised argument per element.
+            "args": [compile_inputs._signature_of(value, f"args[{index}]")
+                     for index, value in enumerate(args)],
+            "kinds": [_container_kind(value) for value in args],
+        }
+        if kwargs:
+            # Sorted by `repr`, which is the order `make_record` folds them in,
+            # so the file says what the key did.
+            order = sorted(kwargs, key=repr)
+            record["kwargs"] = {
+                key: compile_inputs._signature_of(kwargs[key], f"kwargs[{key!r}]")
+                for key in order}
+            record["kwkinds"] = {key: _container_kind(kwargs[key]) for key in order}
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+    except Exception as exc:  # noqa: BLE001 - a capture fault must not be a region fault
+        _capture_off(f"could not build the record for {region_name!r}: "
+                     f"{type(exc).__name__}: {exc}")
+        return
+
+    data = line.encode("utf-8")
+    try:
+        with _CAPTURE_LOCK:
+            descriptor = _CAPTURE_FD
+            if descriptor is None:
+                descriptor = os.open(_CAPTURE_PATH,
+                                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                _CAPTURE_FD = descriptor
+            # ONE write() FOR THE WHOLE LINE. With `O_APPEND` the offset update
+            # and the write are a single operation, so concurrent writers -- the
+            # lowering thread here, another process elsewhere -- cannot interleave
+            # inside a line. A SHORT write would mean the line is already torn, so
+            # it is an error rather than something to retry in pieces.
+            written = os.write(descriptor, data)
+    except Exception as exc:  # noqa: BLE001
+        _capture_off(f"could not append to {_CAPTURE_PATH!r}: "
+                     f"{type(exc).__name__}: {exc}")
+        return
+    if written != len(data):
+        _capture_off(f"a short write to {_CAPTURE_PATH!r} ({written} of {len(data)} "
+                     f"bytes) left a partial line in the file")
+
+
 def consult(*, fn, args: tuple, kwargs: dict, module, region_name: str):
     """Consult the cache for this region call.
 
@@ -1125,6 +1317,19 @@ def consult(*, fn, args: tuple, kwargs: dict, module, region_name: str):
     # performed no lookup, carrying a key that names nothing. Both are
     # forbidden. The fix is ordering, not a special case.
     key = compile_inputs.make_record(fn, args, kwargs, module).key()
+
+    # CAPTURE, AFTER THE KEY AND BEFORE ANYTHING ELSE. The key comes first so
+    # that turning capture on cannot change what the key is; the capture comes
+    # before every branch below so that a MISS the phase gate swallows is still
+    # recorded -- during a real serving run almost every call is MISSed by the
+    # phase gate while the model loads, and those are exactly the calls the warm
+    # needs to replay.
+    #
+    # THE OFF PATH IS THIS ONE TEST. Nothing is imported, computed or opened when
+    # `VLLM_WARM_CAPTURE` is unset.
+    if _CAPTURE_PATH is not None:
+        _capture_call(region_name, args, kwargs)
+
 
     # AN EMPTY KEY MUST BE IMPOSSIBLE BY CONSTRUCTION, NOT MERELY UNLIKELY.
     # `make_record` requires every field and hashes them, so this can only fire

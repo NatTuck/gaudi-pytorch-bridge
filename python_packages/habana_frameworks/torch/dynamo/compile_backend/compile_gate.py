@@ -114,6 +114,7 @@ from __future__ import annotations
 import functools
 import logging
 import threading
+import weakref
 from typing import Any, Final
 
 import torch.nn as nn
@@ -161,6 +162,31 @@ def _qualified(fn: Any) -> str:
 def _region_name(fn: Any) -> str:
     """The stable, human name of a compiled callable, used in logs and errors."""
     return f"torch.compile:{_qualified(fn)}"
+
+
+#: Region name -> the wrapper object the serving path calls.
+#
+# WHY A REGISTRY EXISTS AT ALL. The warm replay (`warm_replay.replay_capture`)
+# has a NAME -- the one the capture file recorded, which is the name the consult
+# logs -- and it must call the SAME object the serving path calls, or the consult
+# it runs is not the consult serving runs and the warm is theatre. For a
+# `Region` that is `vllm_gaudi/device_regions.py`'s registry; for everything
+# `torch.compile` produced, this is it.
+#
+# IT MATTERS FOR THIS MODEL: boot-b8.log has 9 `Qwen3NextDecoderLayer.forward`
+# compiles at serving shapes, plus `model.forward` and 4
+# `extension.ops:_dynamic_quant_naive`, and none of those is a `Region`. They are
+# compiled targets whose only handle is the wrapper built here.
+#
+# WEAK, so the registry cannot extend the life of a compiled module that the
+# model tree has already dropped: a wrapper that is gone reports "not registered
+# in this process" rather than being resurrected from a diagnostic table.
+_REPLAY_REGISTRY: "weakref.WeakValueDictionary[str, Any]" = weakref.WeakValueDictionary()
+
+
+def compiled_regions() -> "weakref.WeakValueDictionary[str, Any]":
+    """The `torch.compile` wrappers by region name, for the warm replay."""
+    return _REPLAY_REGISTRY
 
 
 def _resolve(target: Any) -> tuple[Any, Any]:
@@ -390,6 +416,9 @@ class ConsultFirst:
         if orig_mod is not None:
             self._orig_mod = orig_mod
 
+        # Published for the warm replay, which has the name and needs the object.
+        _REPLAY_REGISTRY[self._name] = self
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return _consult_and_dispatch(
             name=self._name,
@@ -476,6 +505,9 @@ class ConsultFirstModule(nn.Module):
         object.__setattr__(self, "_module", module)
         self._name = _region_name(fn)
         self._file, self._line = _source_position(fn)
+
+        # Published for the warm replay, which has the name and needs the object.
+        _REPLAY_REGISTRY[self._name] = self
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return _consult_and_dispatch(
