@@ -19,11 +19,55 @@ whack-a-mole: the next ``vllm-core`` bump adds another.
 
 So the consult moves to the one place every ``torch.compile`` in the process
 must pass through: ``torch.compile`` itself. ``install()`` patches it, and the
-object it now returns is a :class:`ConsultFirst`, which consults on **every
-call**. On a hit the recipe is launched from disk and Dynamo is never entered at
-all -- not merely not traced, but not reached. On a miss the consult has already
-minted the permit, so the trace that follows is legal, and the permit is revoked
-exactly once when the call finishes.
+object it now returns consults on **every call**. On a hit the recipe is
+launched from disk and Dynamo is never entered at all -- not merely not traced,
+but not reached. On a miss the consult has already minted the permit, so the
+trace that follows is legal, and the permit is revoked exactly once when the
+call finishes.
+
+Two wrapper classes, one consult path
+-------------------------------------
+``torch.compile`` has two kinds of target and they must be wrapped differently.
+
+* A **plain function** or method gets :class:`ConsultFirst`: a callable that is
+  deliberately *not* an ``nn.Module``, because turning a function into a module
+  would change how torch treats it.
+
+* An **``nn.Module``** gets :class:`ConsultFirstModule`, which *is* an
+  ``nn.Module``. This is not cosmetic. ``torch.compile(module)`` returns an
+  ``OptimizedModule``, which is an ``nn.Module``, and the engine assigns
+  compiled modules into the model tree during weight loading:
+
+      hpu_model_runner.py:8224  _compile_region
+        -> vllm_gaudi/utils.py:151  setattr_nested -> setattr(obj, part, value)
+          -> torch/nn/modules/module.py:2020  nn.Module.__setattr__
+
+  which raised ``TypeError: cannot assign 'torch._dynamo.eval_frame.protect.
+  <locals>.wrapper' as child module '0' (torch.nn.Module or None expected)``
+  and killed the boot. A non-module wrapper cannot be assigned there, so the
+  module case must present as a module.
+
+The two classes differ ONLY in how they present themselves to torch. Both call
+the same :func:`_consult_and_dispatch`, so there is exactly one consult path and
+it cannot drift between them.
+
+How the module wrapper presents itself (and why it is not simply nesting)
+-------------------------------------------------------------------------
+``OptimizedModule`` keeps its original module in ``_modules["_orig_mod"]`` and
+nothing else, so its ``state_dict()`` keys are ``_orig_mod.<...>``. To keep
+checkpoint compatibility, :class:`ConsultFirstModule` mirrors that exactly: it
+registers the *original* module under ``_orig_mod`` and holds the compiled
+object outside the module tree.
+
+Registering the compiled object as the child instead would be one level too
+deep -- keys would become ``_orig_mod._orig_mod.<...>`` -- which silently
+renames every key in the checkpoint. So the child is the original module, and
+the compiled callable is stashed with ``object.__setattr__``, which writes
+``__dict__`` directly and therefore leaves ``_modules`` with exactly one entry.
+The parameters are still the same objects the compiled callable uses (the
+compiled module wraps that very module), so ``.parameters()``, ``.to()``,
+``.train()``/``.eval()`` and ``state_dict()`` all behave as they do on the raw
+``torch.compile`` result.
 
 Why construction needs no permit
 --------------------------------
@@ -58,6 +102,11 @@ Known boundaries (each fails loudly, none is silently absorbed)
   executed *before* ``install()``, bypasses the patch. ``torch.compiler.compile``
   does not: it delegates to ``torch.compile`` at call time
   (``torch/compiler/__init__.py:52-57``).
+* A module wrapper forwards attribute *reads* to the compiled object, so
+  ``wrapper.some_submodule`` works, but assigning ``wrapper.some_submodule = x``
+  registers it in the wrapper's own ``_modules`` rather than in ``_orig_mod``.
+  ``OptimizedModule`` has the same hazard, so this matches the behaviour it
+  replaces rather than introducing a new one.
 """
 
 from __future__ import annotations
@@ -67,7 +116,9 @@ import logging
 import threading
 from typing import Any, Final
 
-__all__ = ["ConsultFirst", "install", "installed"]
+import torch.nn as nn
+
+__all__ = ["ConsultFirst", "ConsultFirstModule", "install", "installed"]
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +131,14 @@ _ORIGINAL_MARK: Final[str] = "__compile_gate_original__"
 
 #: Serialises :func:`install` so two threads cannot both patch ``torch.compile``.
 _install_lock: Final[threading.Lock] = threading.Lock()
+
+#: Attributes that ``__getattr__`` may be asked for before ``__init__`` has set
+#: them. Answering those with a forwarded lookup would recurse, so they raise
+#: AttributeError instead. ``_orig_mod`` is NOT in this set: on the module
+#: wrapper it is a real registered child and must resolve normally.
+_PRIVATE_ATTRS: Final[frozenset[str]] = frozenset(
+    {"_compiled", "_target", "_fn", "_module", "_name", "_file", "_line"}
+)
 
 
 def _qualified(fn: Any) -> str:
@@ -114,9 +173,7 @@ def _resolve(target: Any) -> tuple[Any, Any]:
     same function for every instance of that class. For anything else the
     target is already the function.
     """
-    import torch.nn
-
-    if isinstance(target, torch.nn.Module):
+    if isinstance(target, nn.Module):
         return type(target).forward, target
     return target, None
 
@@ -129,8 +186,172 @@ def _source_position(fn: Any) -> tuple[str | None, int | None]:
     return getattr(code, "co_filename", None), getattr(code, "co_firstlineno", None)
 
 
+#: Marker set on a function already made opaque, so the application is idempotent
+#: and can be retried (it is attempted at `install()` and again on the first
+#: consult, because `install()` runs during `import torch`, where `torch._dynamo`
+#: may not be importable yet).
+_OPAQUE_MARK: Final[str] = "__compile_gate_opaque__"
+
+#: Whether the opacity application has succeeded at least once.
+_OPACITY_APPLIED: bool = False
+
+#: How many self-heal attempts have been made. Bounded so an environment where
+#: `torch._dynamo` never becomes importable gets three ERROR lines, not one per
+#: region call.
+_OPACITY_ATTEMPTS: int = 0
+_OPACITY_MAX_ATTEMPTS: Final[int] = 3
+
+
+def _make_opaque(fn: Any) -> Any:
+    """Wrap `fn` so dynamo treats it as ONE opaque call instead of tracing it.
+
+    WHY THIS IS NEEDED. The consult runs inside dynamo traces -- a compiled
+    region called from a traced model frame calls straight into this module --
+    and its Python is not traceable. Dynamo then GRAPH-BREAKS the enclosing
+    frame, splits it, and the remainder becomes a new `graph_<id>` that is
+    compiled for the first time on the SERVING thread (warmup is over), where it
+    can be rejected with synStatus 26.
+
+    Measured: a boot that served 6/6 had zero dynamo frames inside our modules;
+    the failing boot had 15, named `torch_dynamo_resume_in_consult_at_771`,
+    `_consult_and_dispatch` (this file, :189) and `__call__` (:275).
+    `torch_dynamo_resume_in_*` is dynamo's name for the second half of a split
+    frame.
+
+    `recursive=False` IS LOAD-BEARING. The default is recursive, which would
+    suppress tracing for everything called from here -- including
+    `compiled(*args, **kwargs)`, the region itself. That would stop the region
+    being traced at all, and Rule 12 is "hook into @torch.compile, do not
+    eliminate it". With `recursive=False` only THIS function is opaque; the
+    compiled callable inside it still traces normally (measured both ways on
+    this stack).
+
+    Returns `fn` unchanged when `torch._dynamo` is unavailable, and says so at
+    ERROR: a silent no-op restores the graph-break bug with nothing in the log
+    to explain the synStatus 26 that follows.
+    """
+    try:
+        import torch._dynamo as _dynamo  # noqa: PLC0415 - not importable at module load
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "compile_gate: torch._dynamo is unavailable (%s: %s), so the consult "
+            "path CANNOT be made opaque. A compiled region called from a traced "
+            "frame will graph-break it and the split frame may be compiled for "
+            "the first time on the serving thread (synStatus 26).",
+            type(exc).__name__, exc)
+        return fn
+    try:
+        return _dynamo.disable(fn, recursive=False)
+    except TypeError:
+        return _dynamo.disable(fn)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("compile_gate: torch._dynamo.disable failed (%s: %s)",
+                     type(exc).__name__, exc)
+        return fn
+
+
+def _apply_dynamo_opacity() -> bool:
+    """Make the consult path opaque to dynamo. Idempotent; safe to retry.
+
+    ONE place per entry point, and the entry points are exactly three:
+    `_consult_and_dispatch` (the single consult path both wrappers share) and
+    the two wrapper methods that reach it. Decorating the shared function covers
+    the consult and the bundle bookkeeping for both wrappers at once, so the
+    path cannot drift; the two methods are covered as well because they are the
+    frames dynamo actually sees from model code, and a frame it can see is a
+    frame it can split.
+
+    Returns True when everything is opaque.
+    """
+    global _OPACITY_APPLIED, _consult_and_dispatch
+    if getattr(_consult_and_dispatch, _OPAQUE_MARK, False):
+        _OPACITY_APPLIED = True
+        return True
+    wrapped = _make_opaque(_consult_and_dispatch)
+    if wrapped is _consult_and_dispatch:
+        return False
+    setattr(wrapped, _OPAQUE_MARK, True)
+    _consult_and_dispatch = wrapped
+    # `consult` itself too, so a future caller that is not behind one of the
+    # entry points above is still opaque. It lives in recipe_consult, which
+    # imports no torch, so the wrapping has to be requested from here.
+    try:
+        from . import recipe_consult  # noqa: PLC0415
+        recipe_consult.make_consult_opaque()
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        logger.error("compile_gate: could not make recipe_consult.consult opaque "
+                     "(%s: %s)", type(exc).__name__, exc)
+    for owner, attribute in ((ConsultFirst, "__call__"),
+                             (ConsultFirstModule, "forward")):
+        current = getattr(owner, attribute)
+        if getattr(current, _OPAQUE_MARK, False):
+            continue
+        wrapped = _make_opaque(current)
+        if wrapped is current:
+            continue
+        setattr(wrapped, _OPAQUE_MARK, True)
+        setattr(owner, attribute, wrapped)
+    _OPACITY_APPLIED = True
+    return True
+
+
+def _consult_and_dispatch(
+    *,
+    name: str,
+    fn: Any,
+    module: Any,
+    file: str | None,
+    line: int | None,
+    compiled: Any,
+    args: tuple,
+    kwargs: dict,
+) -> Any:
+    """The ONE consult path, shared by both wrapper classes.
+
+    Consult, serve on a hit, otherwise dispatch inside the permit the consult
+    minted and discharge it exactly once. Factored out so the module wrapper and
+    the function wrapper cannot drift apart: the two classes differ only in how
+    they present themselves to torch, never in what they do here.
+    """
+    global _OPACITY_ATTEMPTS
+    if not _OPACITY_APPLIED and _OPACITY_ATTEMPTS < _OPACITY_MAX_ATTEMPTS:
+        # `install()` runs during `import torch`, where `torch._dynamo` may not
+        # be importable yet; this is the retry, on a thread and at a time where
+        # it is. Bounded, so a permanently unavailable torch._dynamo does not
+        # produce one ERROR per region call.
+        _OPACITY_ATTEMPTS += 1
+        _apply_dynamo_opacity()
+
+    from . import launch_ledger, recipe_consult
+    from .trace_gate import TraceGate
+
+    # NO try/except here on purpose. A consult that cannot build a key, or a
+    # cache that cannot be read, must stop the run: a fallback to the
+    # uncompiled callable would hide exactly the class of bug this is for.
+    key, served = recipe_consult.consult(
+        fn=fn, args=args, kwargs=kwargs, module=module, region_name=name
+    )
+
+    if served is not recipe_consult.MISS:
+        # A hit: the recipe was launched from disk and nothing was traced.
+        return served
+
+    # A miss: consult() minted the permit. Publish the region key so the frames
+    # this trace produces are attributed to this region, then discharge the
+    # permit unconditionally.
+    token = launch_ledger.set_declared_identity(name, file, line, key)
+    try:
+        return compiled(*args, **kwargs)
+    finally:
+        frames = launch_ledger.take_bundle(key)
+        if frames:
+            recipe_consult.record_bundle(name, key, frames)
+        TraceGate.revoke()
+        launch_ledger.clear_declared_identity(token)
+
+
 class ConsultFirst:
-    """The object ``torch.compile`` now returns: consult, then dispatch.
+    """The object ``torch.compile`` returns for a non-module target.
 
     Every call goes through the recipe consult first. A hit is served from disk
     and Dynamo is never entered; a miss has already minted a trace permit, so
@@ -141,12 +362,8 @@ class ConsultFirst:
     ``__wrapped__`` points at the wrapped compiled callable, and the usual
     function metadata is copied when the wrapped object is a function.
 
-    It is *not* an ``nn.Module`` even when the wrapped object is one. Upstream
-    code that does ``isinstance(x, torch.nn.Module)`` on the result of
-    ``torch.compile`` will see ``False`` here. Attribute forwarding covers the
-    common uses (``.forward``, parameters, submodules); the ``isinstance`` test
-    is the one thing forwarding cannot cover, and it is called out rather than
-    papered over.
+    It is deliberately NOT an ``nn.Module``, because a function target must not
+    become a module. Module targets get :class:`ConsultFirstModule` instead.
     """
 
     def __init__(self, compiled: Any, target: Any) -> None:
@@ -174,36 +391,16 @@ class ConsultFirst:
             self._orig_mod = orig_mod
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        from . import launch_ledger, recipe_consult
-        from .trace_gate import TraceGate
-
-        # NO try/except here on purpose. A consult that cannot build a key, or a
-        # cache that cannot be read, must stop the run: a fallback to the
-        # uncompiled callable would hide exactly the class of bug this is for.
-        key, served = recipe_consult.consult(
+        return _consult_and_dispatch(
+            name=self._name,
             fn=self._fn,
+            module=self._module,
+            file=self._file,
+            line=self._line,
+            compiled=self._compiled,
             args=args,
             kwargs=kwargs,
-            module=self._module,
-            region_name=self._name,
         )
-
-        if served is not recipe_consult.MISS:
-            # A hit: the recipe was launched from disk and nothing was traced.
-            return served
-
-        # A miss: consult() minted the permit. Publish the region key so the
-        # frames this trace produces are attributed to this region, then
-        # discharge the permit unconditionally.
-        token = launch_ledger.set_declared_identity(self._name, self._file, self._line, key)
-        try:
-            return self._compiled(*args, **kwargs)
-        finally:
-            frames = launch_ledger.take_bundle(key)
-            if frames:
-                recipe_consult.record_bundle(self._name, key, frames)
-            TraceGate.revoke()
-            launch_ledger.clear_declared_identity(token)
 
     def __getattr__(self, name: str) -> Any:
         """Forward unknown attributes to the wrapped compiled callable.
@@ -212,15 +409,7 @@ class ConsultFirst:
         ``_compiled`` itself before ``__init__`` has set it (which would recurse
         forever), and being asked for anything at all on a half-built instance.
         """
-        if name in {
-            "_compiled",
-            "_target",
-            "_fn",
-            "_module",
-            "_name",
-            "_file",
-            "_line",
-        }:
+        if name in _PRIVATE_ATTRS:
             raise AttributeError(name)
         try:
             compiled = self.__dict__["_compiled"]
@@ -232,24 +421,132 @@ class ConsultFirst:
         return f"<ConsultFirst {self._name} -> {type(self._compiled).__name__}>"
 
 
+class ConsultFirstModule(nn.Module):
+    """The object ``torch.compile`` returns for an ``nn.Module`` target.
+
+    Same consult-then-dispatch behaviour as :class:`ConsultFirst` -- both call
+    :func:`_consult_and_dispatch` -- but shaped as an ``nn.Module``, because the
+    engine assigns compiled modules into the model tree and
+    ``nn.Module.__setattr__`` rejects a non-module child.
+
+    The original module is registered as the single child ``_orig_mod``, which
+    is exactly what ``OptimizedModule`` does, so ``state_dict()`` keys,
+    ``.parameters()``, ``.to()``, ``.train()`` and ``.eval()`` all match the raw
+    ``torch.compile`` result. The compiled callable itself is held out of the
+    module tree with ``object.__setattr__`` so ``_modules`` keeps exactly one
+    entry and no parameter is duplicated.
+
+    ``forward`` carries the consult rather than ``__call__``: ``nn.Module``'s
+    own ``__call__`` machinery then still runs, so forward hooks, ``_slow_forward``
+    under tracing, and the rest of the module protocol keep working. Nothing is
+    skipped, because ``_compiled_call_impl`` is a class attribute defaulting to
+    ``None`` (``torch/nn/modules/module.py:480``) and therefore never falls
+    through to the ``__getattr__`` forwarding below.
+    """
+
+    def __init__(self, compiled: Any, target: Any) -> None:
+        # super().__init__() MUST come first: nn.Module.__setattr__ is live
+        # during __init__ and requires _parameters/_modules/_buffers to exist,
+        # so any attribute assignment before this line would be intercepted by
+        # a half-built module.
+        super().__init__()
+
+        # What we present to torch: the underlying module, not the compiled
+        # wrapper. OptimizedModule registers its original module as `_orig_mod`
+        # and nothing else, so its state_dict keys are `_orig_mod.*`. Mirroring
+        # that keeps checkpoint keys identical; registering the OptimizedModule
+        # instead would nest one level deeper and rename every key.
+        content = getattr(compiled, "_orig_mod", None)
+        if not isinstance(content, nn.Module):
+            content = compiled
+        self._orig_mod = content
+
+        # Held OUT of the module tree. `compiled` is an nn.Module, so a normal
+        # assignment would register it in _modules, giving a second entry and
+        # duplicating every parameter in .parameters(). object.__setattr__
+        # writes __dict__ directly and leaves _modules with one entry.
+        object.__setattr__(self, "_compiled", compiled)
+        object.__setattr__(self, "__wrapped__", compiled)
+
+        fn, module = _resolve(target)
+        self._fn = fn
+        # `module` is the target, which is the same object as `_orig_mod`; it
+        # must not go through nn.Module.__setattr__ or it would be registered a
+        # second time under a second name.
+        object.__setattr__(self, "_module", module)
+        self._name = _region_name(fn)
+        self._file, self._line = _source_position(fn)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return _consult_and_dispatch(
+            name=self._name,
+            fn=self._fn,
+            module=self._module,
+            file=self._file,
+            line=self._line,
+            compiled=self._compiled,
+            args=args,
+            kwargs=kwargs,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Let ``nn.Module`` resolve its registries first, then forward.
+
+        ``nn.Module.__getattr__`` is what resolves anything registered in
+        ``_parameters``/``_buffers``/``_modules`` -- including ``_orig_mod`` --
+        so it must be tried first or the module protocol breaks. Only if it
+        fails does the lookup fall through to the wrapped compiled object, which
+        is how ``wrapper.some_submodule`` keeps working.
+
+        A missing name therefore raises AttributeError, not something stranger:
+        ``nn.Module`` raises it, the forward raises it, and the private-attribute
+        guard raises it. That is asserted in the checks.
+        """
+        if name in _PRIVATE_ATTRS:
+            raise AttributeError(name)
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+        compiled = self.__dict__.get("_compiled")
+        if compiled is None:
+            raise AttributeError(name)
+        return getattr(compiled, name)
+
+    def extra_repr(self) -> str:
+        return f"region={self._name!r}"
+
+
+def _wrap(compiled: Any, target: Any) -> Any:
+    """Pick the wrapper class by what ``torch.compile`` actually returned.
+
+    The test is on ``compiled``, not on ``target``: the object being wrapped is
+    what must satisfy the caller's ``isinstance(..., nn.Module)``, and that is
+    the compiled object, whatever the target was.
+    """
+    if isinstance(compiled, nn.Module):
+        return ConsultFirstModule(compiled, target)
+    return ConsultFirst(compiled, target)
+
+
 def _wrap_decorator(decorator: Any) -> Any:
     """Wrap the decorator that bare ``torch.compile(...)`` returns.
 
     ``torch.compile`` with no model returns ``fn`` whose body calls the
     module-global ``compile`` again (``torch/__init__.py:2769-2788``). Because
     :func:`install` patches that very global, the recursive call already lands
-    in our wrapper and the result is already a :class:`ConsultFirst`; the
-    ``isinstance`` check keeps this from stacking a second one. If a future
-    torch stops re-entering the module global, the wrap below still produces the
-    right object.
+    in our wrapper and the result is already wrapped; the ``isinstance`` check
+    keeps this from stacking a second wrapper. If a future torch stops
+    re-entering the module global, the wrap below still produces the right
+    object.
     """
 
     @functools.wraps(decorator)
     def consult_decorator(target: Any) -> Any:
         compiled = decorator(target)
-        if isinstance(compiled, ConsultFirst):
+        if isinstance(compiled, (ConsultFirst, ConsultFirstModule)):
             return compiled
-        return ConsultFirst(compiled, target)
+        return _wrap(compiled, target)
 
     return consult_decorator
 
@@ -278,7 +575,7 @@ def _make_compile_wrapper(original: Any) -> Any:
             # Decorator form: no model yet, so the original returned a decorator.
             return _wrap_decorator(compiled)
 
-        return ConsultFirst(compiled, target)
+        return _wrap(compiled, target)
 
     setattr(compile_wrapper, _WRAPPER_MARK, True)
     setattr(compile_wrapper, _ORIGINAL_MARK, original)
@@ -286,7 +583,7 @@ def _make_compile_wrapper(original: Any) -> Any:
 
 
 def install() -> None:
-    """Patch ``torch.compile`` so it returns :class:`ConsultFirst`.
+    """Patch ``torch.compile`` so it returns a consult-first wrapper.
 
     Idempotent and lock-guarded. A second call is a no-op, and so is a call made
     after another copy of this module (a re-import under a different name) has
@@ -300,6 +597,11 @@ def install() -> None:
     ``torch/__init__.py:3076-3077``, long after ``def compile`` at
     ``torch/__init__.py:2580``.
     """
+    # BEFORE the early return: a second install() must still be able to apply
+    # the opacity that the first one could not (torch._dynamo not yet importable
+    # during `import torch`).
+    _apply_dynamo_opacity()
+
     with _install_lock:
         if installed():
             return

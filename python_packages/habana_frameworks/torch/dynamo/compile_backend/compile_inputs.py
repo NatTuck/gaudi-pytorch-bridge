@@ -758,6 +758,14 @@ class _Walk:
         self.mod_for = {}       # dotted name -> _Module or None  (per call)
         self.bases_of = {}      # (relpath, qualpath) -> bases       (per call)
         self.instance_of = {}   # (relpath, qualpath, name) -> classes (per call)
+        self.init_assign = {}   # (relpath, qualpath, name) -> (mod, RHS) (per call)
+        # ATTRIBUTES WHOSE VALUE IS A RUNTIME INPUT, not source: a call receiver
+        # `self.<attr>...` where `<attr>` is assigned in __init__ to something no
+        # static resolver can know (a parameter, a factory call, a literal). The
+        # code behind it cannot be hashed, so its IDENTITY is captured in the
+        # key's `instance` field at call time instead.
+        self.runtime_dispatched = set()
+        self.runtime_sites = []
         self.seen = {}          # canonical entry -> node
 
     # -- module access -----------------------------------------------------
@@ -884,28 +892,25 @@ class _Walk:
             current = following
         return []
 
-    def init_instance(self, mod, qualpath, name):
-        """[(module, class qualpath)] for `self.<name> = <expr>` in this __init__.
+    def init_assignment(self, mod, qualpath, name):
+        """(module, RHS) for the first `self.<name> = <expr>` in __init__, or None.
 
-        BOUNDED ON PURPOSE. Only three forms resolve, exactly as specified: a call
-        to an in-project class (`Inner()`), an in-project class attribute, and a
-        module-qualified in-project name. No dataflow, no return-value tracking,
-        and only the FIRST assignment in `__init__` -- a later reassignment is not
-        analysed. Anything else (a parameter, a factory function, a subscript, a
-        literal) yields nothing, and the caller decides what that means.
+        The RHS is returned unresolved, because the two callers want different
+        things from it: `init_instance` asks "which in-project class?", and the
+        resolver asks "is this attribute a runtime input at all?".
+
+        BOUNDED ON PURPOSE. Only the FIRST assignment in `__init__` is considered,
+        and the `__init__` may be INHERITED (returned with the module that writes
+        it, since the RHS must resolve in the writing module's namespace).
         """
         key = (mod.relpath, qualpath, name)
-        cached = self.instance_of.get(key)
-        if cached is not None:
-            return cached
-        self.instance_of[key] = []          # cycle guard: never revisit
-        out = []
+        if key in self.init_assign:
+            return self.init_assign[key]
+        self.init_assign[key] = None        # cycle guard: never revisit
+        out = None
         constructor = self.init_node(mod, qualpath)
         if constructor is not None:
             init_mod, init = constructor
-            # The expression is resolved in the namespace of the module that
-            # WRITES the __init__, which is not the class's module when __init__
-            # is inherited from a base in another file.
             for stmt in ast.walk(ast.Module(body=list(init.body), type_ignores=[])):
                 value = None
                 if isinstance(stmt, ast.Assign):
@@ -917,8 +922,29 @@ class _Walk:
                     value = stmt.value
                 if value is not None:
                     # FIRST assignment only: a later reassignment is not analysed.
-                    out = self.class_of_expr(init_mod, value)
+                    out = (init_mod, value)
                     break
+        self.init_assign[key] = out
+        return out
+
+    def init_instance(self, mod, qualpath, name):
+        """[(module, class qualpath)] for `self.<name> = <expr>` in this __init__.
+
+        Only three forms resolve: a call to an in-project class (`Inner()`), an
+        in-project class attribute, and a module-qualified in-project name. No
+        dataflow, no return-value tracking. Anything else (a parameter, a factory
+        function, a subscript, a literal) yields nothing -- and nothing is not a
+        failure: the resolver classifies it as a RUNTIME input.
+        """
+        key = (mod.relpath, qualpath, name)
+        cached = self.instance_of.get(key)
+        if cached is not None:
+            return cached
+        self.instance_of[key] = []          # cycle guard: never revisit
+        assignment = self.init_assignment(mod, qualpath, name)
+        out = []
+        if assignment is not None:
+            out = self.class_of_expr(assignment[0], assignment[1])
         self.instance_of[key] = out
         return out
 
@@ -1007,9 +1033,16 @@ class _Walk:
                     continue
                 source_mod = self.module_for(dotted)
                 if source_mod is not None:
-                    if (symbol in source_mod.bindings
-                            or symbol in source_mod.members(())):
-                        out.extend(self.bare_targets(source_mod, symbol, depth + 1))
+                    # Ask the source module for the symbol WITHOUT pre-checking
+                    # `bindings`: `vllm/distributed/__init__.py` is nothing but
+                    # `from .communication_op import *`, so its names are bound by
+                    # a star import and never appear in `bindings` directly. The
+                    # pre-check skipped them, and a real region that calls
+                    # `tensor_model_parallel_all_reduce` then crashed with "no
+                    # binding anywhere" -- found by replaying the boot failure.
+                    found = self.bare_targets(source_mod, symbol, depth + 1)
+                    if found:
+                        out.extend(found)
                         continue
                     sub_mod = self.module_for(dotted + "." + symbol)
                     if sub_mod is not None:
@@ -1064,20 +1097,59 @@ class _Walk:
                 if found:
                     return found
                 if is_call:
-                    # The receiver of a CALL that we cannot resolve. Code runs
-                    # behind it and would not be hashed, so a required part of the
-                    # key cannot be set: fatal, never skipped.
+                    # A call receiver that did not resolve. Two very different
+                    # cases, and conflating them is what broke serving:
+                    #
+                    # (a) THE FIRST ELEMENT RESOLVES but a later one does not.
+                    #     A member name is wrong. That is a typo, not an input.
+                    # (b) THE FIRST ELEMENT ITSELF is assigned in __init__ to
+                    #     something we cannot resolve statically (a parameter, a
+                    #     factory call, a literal). Its value is fixed at
+                    #     construction, so what `self.quant_method.embedding(...)`
+                    #     executes is a RUNTIME INPUT, not source. No source hash
+                    #     can cover it and skipping it silently would be unsound,
+                    #     so it is RECORDED and captured in the key's `instance`
+                    #     field instead (see `_instance_attributes`).
+                    # (c) nothing anywhere binds it: a typo. Fatal.
+                    first = attrs[0]
+                    if not self.chain_in_class(mod, qualpath, (first,)):
+                        if self.init_assignment(mod, qualpath, first) is not None:
+                            self.runtime_dispatched.add(first)
+                            self.runtime_sites.append(
+                                f"{'.'.join(qualpath)}.{first} at "
+                                f"{mod.relpath}:{lineno}")
+                            return []
+                        # INSTALLED FROM OUTSIDE THE CLASS. A `<expr>.<attr> = ...`
+                        # anywhere in project source makes the attribute a runtime
+                        # input: hpu_model_runner.py:8048 assigns
+                        # `adapter._hpu_raw_process_metadata = ...` onto the adapter
+                        # instance and `HpuModelAdapter.fused_entry_prep` calls it.
+                        # Knowing `adapter` is an HpuModelAdapter needs type
+                        # inference, which we do not build.
+                        #
+                        # WHAT THIS COSTS, PLAINLY: typo detection weakens. A
+                        # misspelled receiver now crashes only if that name is
+                        # never an assignment target anywhere in the project -- so
+                        # a typo that collides with any assigned attribute name in
+                        # the tree is silently treated as a runtime input. That is
+                        # a real loss of strictness, accepted because the
+                        # alternative is crashing on code that works.
+                        if _assigned_anywhere(mod.path, first):
+                            self.runtime_dispatched.add(first)
+                            self.runtime_sites.append(
+                                f"{'.'.join(qualpath)}.{first} at "
+                                f"{mod.relpath}:{lineno} (assigned from outside)")
+                            return []
                     chain = root + "." + ".".join(attrs)
                     raise UnresolvedCallee(
                         f"cannot resolve code identity for {self.region_label}: the "
                         f"receiver '{chain}' at {mod.relpath}:{lineno} is not a "
                         f"member of {'.'.join(qualpath)}, not inherited from an "
-                        f"in-project base, and not assigned in "
-                        f"{qualpath[-1]}.__init__ to an in-project class (only "
-                        f"`Name(...)`, a class attribute, or a module-qualified "
-                        f"in-project name can be followed). Code reached through it "
-                        f"would not be hashed, so this is fatal rather than hashed "
-                        f"as if the call were absent.")
+                        f"in-project base, not assigned in "
+                        f"{qualpath[-1]}.__init__, and not an assignment target "
+                        f"anywhere in project source. A name bound nowhere is a "
+                        f"typo, so this is fatal rather than hashed as if the call "
+                        f"were absent.")
                 return []                     # a VALUE read: opaque, skipped
             if root in locals_:
                 return []                     # attribute on a local/unknown value
@@ -1208,6 +1280,18 @@ def code_identity(fn) -> str:
             f"the DEFINING class in __qualname__, so this means the name is wrong.)")
 
     entries = walk.run(mod, qualpath, name)
+    _record_runtime_dispatch(fn, walk)
+    return _hash_entries(entries)
+
+
+def _hash_entries(entries) -> str:
+    """blake2b over {(relpath, qualpath, name): node}, canonically ordered.
+
+    Keyed on the QUALIFIED NAME and the normalised AST, never on the file path:
+    a rename does not change a lowered graph, so it must not invalidate a recipe
+    (PROTOCOL §8), and two identical trees must agree wherever they live.
+    """
+    import hashlib
 
     h = hashlib.blake2b(digest_size=16)
     rows = []
@@ -1221,6 +1305,45 @@ def code_identity(fn) -> str:
         h.update(dump.encode("utf-8"))
         h.update(b"\0")
     return h.hexdigest()
+
+
+# region identity -> the attribute names that walk found to be RUNTIME inputs.
+#
+# WHY A REGISTRY AND NOT A RETURN VALUE: the names are needed by
+# `_instance_attributes`, which `make_record` calls after the identity has been
+# obtained -- and for a REGISTERED region the identity comes from `_region_code`,
+# computed once at `Region` construction. So the names are recorded where the walk
+# already runs, under the same "module:qualname" key the registry uses.
+#
+# SAME LIFECYCLE AS `_region_code`, AND THAT IS THE HONEST LIMIT: a registered
+# region's digest is also fixed at construction, so if a source file changes while
+# the process lives, both the digest and this list are from the same (stale)
+# moment. A stale list can only produce a key that MISSES, never a false hit,
+# because the stale list travels with the stale digest.
+_runtime_dispatch: dict[str, tuple] = {}
+
+
+def _record_runtime_dispatch(fn, walk) -> None:
+    names = tuple(sorted(walk.runtime_dispatched))
+    qualname = getattr(fn, "__qualname__", "")
+    module = getattr(fn, "__module__", None)
+    if module:
+        _runtime_dispatch[f"{module}:{qualname}"] = names
+    _runtime_dispatch.setdefault(qualname, names)
+    if names:
+        logger.info("runtime-dispatched receivers for %s: %s (%s)", qualname,
+                    ", ".join(names), "; ".join(walk.runtime_sites))
+
+
+def runtime_attrs(fn) -> tuple:
+    """The attribute names that this region's walk classified as runtime inputs."""
+    qualname = getattr(fn, "__qualname__", "")
+    module = getattr(fn, "__module__", None)
+    if module:
+        hit = _runtime_dispatch.get(f"{module}:{qualname}")
+        if hit is not None:
+            return hit
+    return _runtime_dispatch.get(qualname, ())
 
 
 # Region name -> code identity, registered where the function object exists (the
@@ -1479,7 +1602,7 @@ def _resolve_path(root, path):
     return mod
 
 
-def _attribute_locations(model) -> tuple:
+def _attribute_locations(model, names=_GUARDED_ATTRS) -> tuple:
     """Every (path, attribute) occurrence of a guarded attribute in the model tree.
 
     BUILT ONCE PER MODEL OBJECT and cached on its identity. The walk is the
@@ -1492,7 +1615,7 @@ def _attribute_locations(model) -> tuple:
     trade: a shared entry would violate "invalidate only if the recipe changed",
     and safety wins.
     """
-    key = id(model)
+    key = (id(model), tuple(names))
     hit = _LOCATION_CACHE.get(key)
     if hit is not None and hit[0] is model:
         return hit[1]
@@ -1500,16 +1623,327 @@ def _attribute_locations(model) -> tuple:
     modules = 0
     for path, mod in _walk_modules(model):
         modules += 1
-        for name in _GUARDED_ATTRS:
+        for name in names:
             if hasattr(mod, name):
                 locations.append((path, name))
     locations = tuple(locations)
-    logger.info("attr-locations: %d paths over %d modules", len(locations), modules)
+    logger.info("attr-locations: %d paths over %d modules (%d names)",
+                len(locations), modules, len(names))
     _LOCATION_CACHE[key] = (model, locations)
     return locations
 
 
-def _instance_attributes(module) -> tuple:
+def _project_root_dirs(path: str) -> tuple:
+    """The project source trees this file belongs to, found by path only.
+
+    Walks up from the file and, at each ancestor, takes the ancestor itself and any
+    immediate child whose NAME is a project root. That is enough to find the file's
+    own tree AND its siblings -- from `<...>/gaudi2-single-card-vllm/vllm-gaudi/x.py`
+    it finds `vllm-gaudi`, its sibling `vllm-core`, and one level further up the
+    bridge tree -- without importing anything or guessing beyond `listdir`.
+    """
+    try:
+        current = os.path.dirname(os.path.abspath(path))
+    except OSError:
+        return ()
+    found = []
+    seen = set()
+    while True:
+        candidates = []
+        if os.path.basename(current) in _PROJECT_ROOTS:
+            candidates.append(current)
+        try:
+            for child in os.listdir(current):
+                if child in _PROJECT_ROOTS:
+                    candidates.append(os.path.join(current, child))
+        except OSError:
+            pass
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                found.append(candidate)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return tuple(found)
+
+
+# root set -> {attribute name: (files that mention it as a possible target, ...)}
+_ASSIGNMENT_INDEX: dict[tuple, dict] = {}
+
+# A CANDIDATE FILTER, not the answer. These match any place a name could appear
+# after a dot in a position that assigns it, plus `setattr(obj, "name", ...)`.
+# Over-matching is deliberate and harmless: a candidate is CONFIRMED by parsing it
+# (see `_is_attribute_target`), so the answer for the name actually asked about is
+# exact while the index is only a superset.
+_ATTR_TARGET_RE = (
+    rb"\.\s*([A-Za-z_][A-Za-z_0-9]*)\s*"
+    rb"(?::[^=\n]*|,|(?:\*\*|//|>>|<<|[-+*/%&|^@])?=(?!=))")
+def _project_assignment_index(root_dirs) -> dict:
+    """{attribute name: (files that might assign it)} for these project trees.
+
+    BUILT ONCE PER PROCESS PER ROOT SET, and only when a receiver would otherwise
+    be declared a typo, so the common path pays nothing.
+
+    WHY NOT AN AST SET OF ALL NAMES, which is what I wrote first: parsing every
+    project file to collect the exact set costs 29 s COLD on this checkout (6,455
+    files), measured, because one region's first typo would pay for the whole tree.
+    A byte pass costs 0.4 s for the same trees, so the index is byte-built and the
+    answer is confirmed by parsing only the handful of files that mention the name
+    -- usually one. Same result, 1/70th of the cost.
+
+    A MISSED CANDIDATE IS STILL A MISSED ASSIGNMENT, so the patterns deliberately
+    over-match: `x.attr =`, augmented and annotated forms, tuple targets (`,`) and
+    `setattr(x, "attr", ...)`. `del x.attr` is covered by the `,`-less form only
+    through `_is_attribute_target`, which sees Del contexts in the files the index
+    proposes; a name assigned ONLY by `del` would be missed. That is stated rather
+    than hidden.
+    """
+    key = tuple(sorted(root_dirs))
+    hit = _ASSIGNMENT_INDEX.get(key)
+    if hit is not None:
+        return hit
+    import re
+
+    attr_re = re.compile(
+        rb"\.\s*([A-Za-z_][A-Za-z_0-9]*)\s*"
+        rb"(?::[^=\n]*|,|(?:\*\*|//|>>|<<|[-+*/%&|^@])?=(?!=))")
+    setattr_re = re.compile(
+        rb"setattr\s*\(\s*[^,()]+,\s*[\"']([A-Za-z_][A-Za-z_0-9]*)[\"']")
+    index: dict[str, list] = {}
+    files = 0
+    for root in key:
+        for dirpath, dirs, names in os.walk(root):
+            dirs[:] = sorted(d for d in dirs
+                             if d not in ("__pycache__", ".git", "venv",
+                                          "site-packages", "node_modules"))
+            for name in sorted(names):
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    with open(path, "rb") as stream:
+                        blob = stream.read()
+                except OSError:
+                    continue
+                files += 1
+                for match in attr_re.finditer(blob):
+                    index.setdefault(match.group(1).decode("ascii", "replace"),
+                                     []).append(path)
+                for match in setattr_re.finditer(blob):
+                    index.setdefault(match.group(1).decode("ascii", "replace"),
+                                     []).append(path)
+    out = {name: tuple(sorted(set(paths))) for name, paths in index.items()}
+    _ASSIGNMENT_INDEX[key] = out
+    logger.info("project assignment index: %d names from %d files in %d root(s)",
+                len(out), files, len(key))
+    return out
+
+
+def _is_attribute_target(path: str, name: str) -> bool:
+    """Whether `path` really assigns `path.<name>` (or setattr's it). EXACT.
+
+    This is the confirmation step: the index only proposes files, this decides.
+    """
+    tree = _parse(path)
+    if tree is None:
+        return False
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and node.attr == name
+                and isinstance(node.ctx, (ast.Store, ast.Del))):
+            return True
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "setattr" and len(node.args) >= 2):
+            argument = node.args[1]
+            if isinstance(argument, ast.Constant) and argument.value == name:
+                return True
+    return False
+
+
+def _assigned_anywhere(region_path: str, name: str) -> bool:
+    """Whether `name` is an attribute assignment target anywhere in project source."""
+    index = _project_assignment_index(_project_root_dirs(region_path))
+    for candidate in index.get(name, ()):
+        if _is_attribute_target(candidate, name):
+            return True
+    return False
+
+
+def _class_source_digest(cls) -> str:
+    """Hash of a class's IN-PROJECT source: its body and its in-project bases.
+
+    "external" when the class is not project source -- library code is identified
+    by version, which is the existing rule, and nothing here reads it.
+    "nosource" when it IS project source but cannot be located in its module (built
+    by `type(...)`, or defined in a local scope). That string is a recorded value,
+    so a class BECOMING locatable is itself a key change.
+    """
+    module_name = getattr(cls, "__module__", None)
+    if not module_name:
+        return "external"
+    import sys
+
+    module = sys.modules.get(module_name)
+    path = getattr(module, "__file__", None) if module is not None else None
+    if not path:
+        path = _module_file_for(module_name)
+    if not path or not path.endswith(".py") or not _in_project(path):
+        return "external"
+    qualname = str(getattr(cls, "__qualname__", ""))
+    parts = qualname.split(".")
+    if not qualname or "<locals>" in parts:
+        return "nosource"
+    walk = _Walk(region_label=f"{module_name}:{qualname}")
+    mod = walk.module(path)
+    if mod is None:
+        return "nosource"
+    entries = walk.run(mod, tuple(parts[:-1]), parts[-1])
+    return _hash_entries(entries) if entries else "nosource"
+
+
+def _type_name(value) -> str:
+    """`module:qualname` of a value's TYPE. Never `repr`."""
+    cls = type(value)
+    return (f"{getattr(cls, '__module__', '') or ''}:"
+            f"{getattr(cls, '__qualname__', '') or ''}")
+
+
+def _owner_name(owner) -> str:
+    """`module:qualname` for the object a method is bound to.
+
+    For a classmethod the owner IS a class, and naming `type(owner)` would say
+    `builtins:type` -- which identifies nothing.
+    """
+    if isinstance(owner, type):
+        return (f"{getattr(owner, '__module__', '') or ''}:"
+                f"{getattr(owner, '__qualname__', '') or ''}")
+    return _type_name(owner)
+
+
+def _function_source_digest(fn) -> str:
+    """Hash of a function's IN-PROJECT source, including what it inlines.
+
+    Same machinery as `code_identity` (the walk and `_hash_entries`), so a change
+    anywhere in the callable's body -- or in anything it calls -- moves it.
+    "external" for a C function, a slot wrapper, or any file outside the project
+    roots: library code is identified by version, and nothing reads it.
+    "nosource" for a project function that cannot be addressed by qualified name
+    (one defined in a local scope); that string is a recorded value.
+
+    An `UnresolvedCallee` raised by the walk is NOT caught: if the callable's own
+    body cannot be identified, a required part of the key cannot be set.
+    """
+    if fn is None:
+        return "external"
+    path = getattr(getattr(fn, "__code__", None), "co_filename", None)
+    qualname = getattr(fn, "__qualname__", None)
+    if not path or not qualname:
+        return "external"
+    if not _in_project(path):
+        return "external"
+    parts = qualname.split(".")
+    if "<locals>" in parts:
+        return "nosource"
+    walk = _Walk(region_label=f"{qualname} at {path}")
+    mod = walk.module(path)
+    if mod is None:
+        return "nosource"
+    entries = walk.run(mod, tuple(parts[:-1]), parts[-1])
+    return _hash_entries(entries) if entries else "nosource"
+
+
+def _type_identity(value, cache=None) -> str:
+    """A stable identity for an object-valued attribute: its type, and its source.
+
+    NEVER `repr`: that embeds an address and would change the key every process.
+    The type's in-project SOURCE is included because the type name alone does not
+    invalidate when the implementation changes -- `UnquantizedEmbeddingMethod`'s
+    body decides what `self.quant_method.embedding(...)` executes, and a rename of
+    nothing is not what changes. External types contribute their name only
+    (`+external`), because external code is identified by version.
+    """
+    cls = type(value)
+    key = id(cls)
+    if cache is not None and key in cache:
+        return cache[key]
+    ident = (f"{getattr(cls, '__module__', '') or ''}:"
+             f"{getattr(cls, '__qualname__', '') or ''}"
+             f"+{_class_source_digest(cls)}")
+    if cache is not None:
+        cache[key] = ident
+    return ident
+
+
+def _instance_value(value, cache=None, depth=0):
+    """A STABLE signature for one guarded attribute's value.
+
+    Scalars record their VALUE: an int that selects a graph is an input. Objects
+    record their TYPE (see `_type_identity`), never `repr`. A TENSOR keeps the
+    module's tensor signature -- shape, dtype, stride -- because it is stable and
+    says more than "torch:Tensor" does.
+    """
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int", value)
+    if isinstance(value, float):
+        return ("float", repr(value))
+    if isinstance(value, str):
+        return ("str", value)
+    if value is None:
+        return ("none", None)
+    # torch is CONSULTED, never imported here: a plain object attribute must not
+    # drag torch (and the HPU autoload shim behind it) into a process to answer a
+    # question about its type name. If torch is not loaded, no value in this
+    # process can be a torch value, so the checks are correctly skipped.
+    import sys
+
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        if isinstance(value, torch.dtype):
+            return ("dtype", str(value))
+        if isinstance(value, torch.device):
+            return ("device", str(value))
+        if isinstance(value, torch.Tensor):
+            return _tensor_signature(value)
+    # CALLABLE VALUES ARE IDENTIFIED BY THE CALLABLE, NOT BY `type(value)`.
+    # `self._hpu_raw_process_metadata = adapter.metadata_processor.process_metadata`
+    # installs a BOUND METHOD, and `type(value)` is `builtins:method` for EVERY
+    # bound method in the process: it discriminates nothing, so two different
+    # implementations would share a key. A bound method is identified by its owner
+    # type, its function's qualname, and that function's source.
+    func = getattr(value, "__func__", None)
+    owner = getattr(value, "__self__", None)
+    if func is not None and owner is not None:
+        return ("method",
+                f"{_owner_name(owner)}.{getattr(func, '__qualname__', '?')}"
+                f"+{_function_source_digest(func)}")
+    if (getattr(value, "__code__", None) is not None
+            and getattr(value, "__qualname__", None)):
+        return ("function",
+                f"{getattr(value, '__module__', '') or ''}:{value.__qualname__}"
+                f"+{_function_source_digest(value)}")
+    import functools
+
+    if isinstance(value, functools.partial):
+        if depth > 4:
+            return ("partial", "deep")
+        inner = _instance_value(value.func, cache, depth + 1)
+        args = tuple(_instance_value(a, cache, depth + 1) for a in value.args)
+        kwargs = tuple(sorted((k, _instance_value(v, cache, depth + 1))
+                              for k, v in value.keywords.items()))
+        # Every element is already a stable value, so repr() of the tuple is stable
+        # too -- there is no address anywhere inside it.
+        return ("partial", repr((inner, args, kwargs)))
+    if callable(value):
+        return ("callable",
+                f"{_type_name(value)}+"
+                f"{_function_source_digest(getattr(type(value), '__call__', None))}")
+    return ("object", _type_identity(value, cache))
+
+
+def _instance_attributes(module, extra_names=()) -> tuple:
     """The guarded attributes, read through the cached location map.
 
     `ABSENT` IS A RECORDED VALUE, not a skip. Dynamo guards on absence too --
@@ -1518,11 +1952,17 @@ def _instance_attributes(module) -> tuple:
     """
     if module is None:
         return ()
+    names = tuple(_GUARDED_ATTRS) + tuple(
+        n for n in extra_names if n not in _GUARDED_ATTRS)
+    type_cache = {}          # one source hash per TYPE per call, not per attribute
     out = []
-    for path, name in _attribute_locations(module):
+    for path, name in _attribute_locations(module, names):
         obj = _resolve_path(module, path)
-        value = getattr(obj, name, "ABSENT") if obj is not None else "ABSENT"
-        out.append((f"{path}.{name}" if path else name, value))
+        if obj is None or not hasattr(obj, name):
+            out.append((f"{path}.{name}" if path else name, "ABSENT"))
+            continue
+        out.append((f"{path}.{name}" if path else name,
+                    _instance_value(getattr(obj, name), type_cache)))
     return tuple(out)
 
 
@@ -1563,34 +2003,67 @@ def make_record(fn, args, kwargs, module) -> CompileInputs:
         # LEGITIMATE: arbitrary `torch.compile` targets are not Regions and are
         # never registered, so the source walk is the only way to identify them.
         code = code_identity(fn)
+    # THE RUNTIME-DISPATCHED ATTRIBUTES COME FROM THE WALK, not from a list.
+    # `code_identity` records them under the region's "module:qualname" as it runs,
+    # so by here they are known -- whether the identity came from the registry
+    # (recorded at Region construction) or from the walk just above.
     return build(
-        instance=_instance_attributes(module),
+        instance=_instance_attributes(module, runtime_attrs(fn)),
         region=(("name", name), ("code", code)),
         shapes=tuple(shapes),
     )
 
 
-def frame_record(name: str, identity: str, gm) -> CompileInputs:
-    """The record for ONE FX frame, from what the frame already holds.
+#: Ordered placeholder signatures per FRAME key, for BINDING verification.
+#:
+#: WHY THIS EXISTS. The recipe key says which graph a call needs; it does not say
+#: which of the caller's arguments goes into which of the graph's inputs. The
+#: consult passes `tuple(args)` positionally and the C++ `update_patching_table`
+#: binds strictly positionally, so if recipe input i is not the caller's argument
+#: i, a launch puts the WRONG tensor in the right place -- silent corruption
+#: rather than an error. There is already an artifact whose input is named
+#: `%arg1_1` where the region's first parameter is `dest`, so the obvious binding
+#: cannot be assumed.
+#:
+#: The list is the same one the key is built from (`placeholder_signatures`), so
+#: the manifest and the key cannot disagree about what the frame expects.
+_FRAME_BINDINGS: "dict[str, list]" = {}
 
-    PER FRAME, NOT PER REGION. One `torch.compile` target can produce many
-    frames -- one per inner function dynamo compiles -- and keying them all by
-    the *outer* call's arguments makes every frame after the first load the first
-    frame's recipe. Measured: key `c34a07e9` was asked for by both
 
-        graph_0115  identity=FusedRMSNorm.py:forward#f5cddcdf
-        graph_0116  identity=qwen3_5.py:_resolve_state_indices#3ae6a6e6
+def remember_frame_binding(frame_key: str, shapes) -> None:
+    """Record the ordered placeholder signatures for `frame_key`.
 
-    both `region=model.forward`, and the arity mismatch that killed serving
-    (`running index 4 mismatch with num_inputs 3`) came from exactly that.
+    Called from `frame_record`, which is the one place that has both the frame's
+    placeholders and its key. Keyed by the frame key because that is what the
+    bundle (`launch_ledger.take_bundle`) and the manifest carry.
+    """
+    if not frame_key:
+        return
+    _FRAME_BINDINGS[frame_key] = list(shapes)
 
-    The frame's own placeholders are the inputs the compile actually sees, so
-    they are the inputs the key has to describe.
 
-    COST, stated plainly: this key is computed AFTER tracing. A cache hit
-    therefore skips the Synapse compile (2-3 s per graph) but NOT the trace.
-    That is a real win, and it is not a trace-free hit -- the trace-free hit was
-    given up deliberately when the unit moved from region to frame.
+def frame_binding(frame_key: str):
+    """Pop the ordered placeholder signatures for `frame_key`, or None.
+
+    POPPED, not read, for the same reason `take_bundle` pops: a second trace of
+    the same frame must use its own binding, and a stale read would silently
+    verify a call against a previous trace's inputs.
+
+    None means "this process does not know what this frame expects", which the
+    consult treats as unverifiable -- a MISS, never a launch.
+    """
+    if not frame_key:
+        return None
+    return _FRAME_BINDINGS.pop(frame_key, None)
+
+
+def placeholder_signatures(gm, name: str, identity: str) -> list:
+    """The ordered signature of every placeholder in `gm`, flattened.
+
+    Extracted from `frame_record` so the manifest's binding record and the
+    recipe key are produced by ONE function. Two functions would eventually
+    disagree, and the disagreement would be a launch with the wrong tensor in
+    the wrong slot.
     """
     shapes = []
     for node in gm.graph.nodes:
@@ -1617,8 +2090,40 @@ def frame_record(name: str, identity: str, gm) -> CompileInputs:
                 f"'{node.name}' with no example_value, val or tensor_meta, so its "
                 f"shape cannot be read. Refusing to build a key that omits it.")
         shapes.extend(_signature_of(value, node.name))
-    return build(
+    return shapes
+
+
+def frame_record(name: str, identity: str, gm) -> CompileInputs:
+    """The record for ONE FX frame, from what the frame already holds.
+
+    PER FRAME, NOT PER REGION. One `torch.compile` target can produce many
+    frames -- one per inner function dynamo compiles -- and keying them all by
+    the *outer* call's arguments makes every frame after the first load the first
+    frame's recipe. Measured: key `c34a07e9` was asked for by both
+
+        graph_0115  identity=FusedRMSNorm.py:forward#f5cddcdf
+        graph_0116  identity=qwen3_5.py:_resolve_state_indices#3ae6a6e6
+
+    both `region=model.forward`, and the arity mismatch that killed serving
+    (`running index 4 mismatch with num_inputs 3`) came from exactly that.
+
+    The frame's own placeholders are the inputs the compile actually sees, so
+    they are the inputs the key has to describe.
+
+    COST, stated plainly: this key is computed AFTER tracing. A cache hit
+    therefore skips the Synapse compile (2-3 s per graph) but NOT the trace.
+    That is a real win, and it is not a trace-free hit -- the trace-free hit was
+    given up deliberately when the unit moved from region to frame.
+    """
+    shapes = placeholder_signatures(gm, name, identity)
+    record = build(
         instance=(),
         region=(("name", name), ("code", identity)),
         shapes=tuple(shapes),
     )
+    # Remember what this frame expects, under the key this record produces, so
+    # the manifest can carry the BINDING and a later boot can verify that the
+    # caller's positional arguments still line up with the recipe's inputs.
+    # Keyed here because this is the only place that holds both.
+    remember_frame_binding(record.key(), shapes)
+    return record

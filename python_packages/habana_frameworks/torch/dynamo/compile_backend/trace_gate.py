@@ -104,10 +104,18 @@ from __future__ import annotations
 
 import functools
 import importlib
+import logging
 import threading
 from typing import Any, Final
 
-__all__ = ["TraceWithoutCacheConsult", "TraceGate"]
+__all__ = ["TraceWithoutCacheConsult", "TraceGate", "ATTRIBUTION_MISMATCHES"]
+
+logger = logging.getLogger(__name__)
+
+#: Every advisory attribution mismatch seen this process, newest last. Reported,
+#: never raised: see the comment in `TraceGate.assert_permitted`. Read by the
+#: report so "the gate is quiet" and "the gate never looked" are distinguishable.
+ATTRIBUTION_MISMATCHES: list[str] = []
 
 #: Module that owns the frame-conversion choke point.
 _TARGET_MODULE: Final[str] = "torch._dynamo.convert_frame"
@@ -170,12 +178,15 @@ class _Permit:
     until the matching :meth:`TraceGate.revoke` returns it.
     """
 
-    __slots__ = ("region", "key", "frames_traced")
+    __slots__ = ("region", "key", "frames_traced", "reported")
 
     def __init__(self, region: str, key: str) -> None:
         self.region: str = region
         self.key: str = key
         self.frames_traced: int = 0
+        #: Whether an attribution mismatch has already been reported for this
+        #: permit, so a region that trips it reports once and not once per frame.
+        self.reported: bool = False
 
     def describe(self) -> str:
         """Render this permit for an error message."""
@@ -235,6 +246,36 @@ def _looks_like_frame(obj: Any) -> bool:
         return False
 
 
+def _find_frame(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """The frame being converted, or None.
+
+    ``ConvertFrameAssert.__call__(self, frame, cache_entry, hooks, frame_state)``
+    takes the frame as its second positional argument. The scan is over all
+    arguments rather than a fixed index so the gate stays correct if the
+    position moves, and so a ``frame`` passed by keyword is still found.
+    """
+    candidates: list[Any] = list(args) + list(kwargs.values())
+    for candidate in candidates:
+        if _looks_like_frame(candidate):
+            return candidate
+    return None
+
+
+def _describe_frame(frame: Any) -> str:
+    """``name (file:line)`` for a frame, or an honest note when there is none."""
+    if frame is None:
+        return (
+            "an unnamed frame (no frame object was visible in the arguments to "
+            "ConvertFrameAssert.__call__; the first positional argument is the "
+            "converter, the second is the frame)"
+        )
+    code = frame.f_code
+    return (
+        f"{getattr(code, 'co_name', '<unknown>')} "
+        f"({code.co_filename}:{frame.f_lineno})"
+    )
+
+
 def _locate_frame(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
     """Describe the frame being converted, from a call's arguments.
 
@@ -247,19 +288,99 @@ def _locate_frame(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
     "unknown", so when no frame is found the message says exactly that instead
     of guessing.
     """
-    candidates: list[Any] = list(args) + list(kwargs.values())
-    for candidate in candidates:
-        if _looks_like_frame(candidate):
-            code = candidate.f_code
-            return (
-                f"{getattr(code, 'co_name', '<unknown>')} "
-                f"({code.co_filename}:{candidate.f_lineno})"
-            )
-    return (
-        "an unnamed frame (no frame object was visible in the arguments to "
-        "ConvertFrameAssert.__call__; the first positional argument is the "
-        "converter, the second is the frame)"
-    )
+    return _describe_frame(_find_frame(args, kwargs))
+
+
+def _split_region(region: str) -> tuple[str, str]:
+    """``(module, qualname)`` from a region name, or ``("", region)``.
+
+    Region names come from two places and both are ``module:qualname``:
+    ``device_regions`` builds ``f"{fn.__module__}:{fn.__qualname__}"`` and
+    ``compile_gate`` builds ``f"torch.compile:{module}:{qualname}"``. The prefix
+    is stripped so the two compare the same way.
+    """
+    text = region
+    prefix = "torch.compile:"
+    if text.startswith(prefix):
+        text = text[len(prefix):]
+    module, sep, qualname = text.rpartition(":")
+    if not sep:
+        return "", text
+    return module, qualname
+
+
+def _same_module(frame: Any, region: str) -> bool:
+    """True when the frame's file looks like the region's module.
+
+    Used only to keep the advisory attribution report quiet: a frame from a
+    DIFFERENT module is unambiguously a callee of the region, so there is nothing
+    to report. Returns True when the module cannot be determined, so an unknown
+    layout is reported rather than silently skipped.
+    """
+    module, _qualname = _split_region(region)
+    code = getattr(frame, "f_code", None)
+    if not module or code is None:
+        return True
+    suffix = module.replace(".", "/") + ".py"
+    return str(getattr(code, "co_filename", "")).replace("\\", "/").endswith(suffix)
+
+
+def _attribution_mismatch(frame: Any, region: str) -> str | None:
+    """None if the frame can be attributed to ``region``, else the reason.
+
+    ADVISORY. The result is reported and counted; it never aborts a trace. See
+    the comment in :meth:`TraceGate.assert_permitted` for the boot that made a
+    hard refusal untenable.
+
+    WHAT IT CATCHES, precisely: the FIRST frame converted under a permit came
+    from the region's own module but has a different name from the region. That
+    is the shape of "this permit authorised converting a different function in
+    the same file", which is worth knowing about.
+
+    WHAT IT CANNOT CATCH, stated rather than glossed:
+
+      * A callee. Dynamo converts the functions a region calls, and their names
+        are unrelated to the region's by construction. This is why the check is
+        advisory: a wrong region and a callee are the SAME observation.
+      * The region's own frame may not be the first one converted at all. If it
+        is already compiled, dynamo reuses the cached code object and the first
+        conversion under a new permit is whichever callee is new -- exactly
+        boot-b1.log, where the first frame was `Logger.info`.
+      * Two same-named functions are indistinguishable; it compares names, not
+        identities.
+      * Anything after the first conversion under a permit (not checked at all).
+      * Nested permits: a correct outer permit with inner code from elsewhere.
+
+    The relation is on the name because the name is what both sides share: a
+    permit carries ``region`` (``module:qualname``), and the frame carries its
+    code object's ``co_qualname``. Match means equal, or one a dotted suffix of
+    the other -- a nested function's qualname is ``outer.<locals>.inner`` and a
+    method's is ``Class.method``, and both must be accepted.
+    """
+    if not region:
+        # An unnamed permit cannot be attributed to anything. Refusing here would
+        # be refusing a permit the protocol says must never exist, which mint()
+        # already prevents; there is nothing to compare against.
+        return None
+    if frame is None:
+        return ("the frame being converted could not be identified, so it cannot "
+                "be attributed to the permit that authorised it")
+    code = getattr(frame, "f_code", None)
+    if code is None:
+        return ("the object being converted has no code object, so it cannot be "
+                "attributed to the permit that authorised it")
+    frame_qual = (getattr(code, "co_qualname", None)
+                  or getattr(code, "co_name", "") or "")
+    _module, region_qual = _split_region(region)
+    if not region_qual:
+        return None
+    if (frame_qual == region_qual
+            or frame_qual.endswith("." + region_qual)
+            or region_qual.endswith("." + frame_qual)):
+        return None
+    return (f"the frame being converted is {frame_qual!r} "
+            f"({code.co_filename}:{frame.f_lineno}), which is not attributable to "
+            f"the innermost permit")
 
 
 class TraceGate:
@@ -339,8 +460,8 @@ class TraceGate:
         return permit.frames_traced
 
     @staticmethod
-    def assert_permitted(what: str) -> None:
-        """Assert that tracing is authorised; count it against the permit.
+    def assert_permitted(what: str, frame: Any = None) -> None:
+        """Assert that tracing is authorised AND attributable; count it.
 
         Called at the top of every frame conversion.  On success the innermost
         permit's ``frames_traced`` counter is incremented so that
@@ -349,6 +470,14 @@ class TraceGate:
         On an empty stack this raises :class:`TraceWithoutCacheConsult`.  There
         is no return-value signal and no logging-only path: an unauthorised
         trace attempt always raises.
+
+        ``frame`` is the frame object being converted, when the caller has it.
+        The FIRST conversion under a permit must be attributable to that permit
+        by name (see :func:`_attribution_mismatch`); a permit minted for one
+        region must not authorise converting a different region's code. Later
+        conversions under the same permit are the region's own callees and are
+        not checked, because their names are unrelated to the region's by
+        construction.
         """
         permits = TraceGate._local.permits
         if not permits:
@@ -371,7 +500,56 @@ class TraceGate:
                 "  permits held on this thread (innermost last):\n"
                 "    (no permits held)\n"
             )
-        permits[-1].frames_traced += 1
+        permit = permits[-1]
+        permit.frames_traced += 1
+
+        # ATTRIBUTION IS CHECKED ON THE FIRST CONVERSION ONLY, AND IT IS
+        # ADVISORY. Both halves of that sentence are the result of a boot.
+        #
+        # The first conversion is the only one that could ever be attributed:
+        # every later frame under a permit is a function the region calls --
+        # dynamo converts those too -- and their names are unrelated to the
+        # region's by construction.
+        #
+        # But even the FIRST conversion is not reliably the region's own frame.
+        # boot-b1.log, the serving blocker: a permit for
+        # `HPUAttentionMetadataProcessor.process_metadata` was minted, and the
+        # first frame converted under it was `Logger.info` in
+        # /usr/lib/python3.12/logging/__init__.py -- because `process_metadata`
+        # had already been compiled, so dynamo reused its cached code object and
+        # never re-converted it, while a callee inside it was converted for the
+        # first time. `frames_traced=1` in that report is proof it was the FIRST
+        # conversion under the permit, so "check only the first" does not save
+        # it. A raise there killed the engine (EngineDeadError) and lost serving.
+        #
+        # There is no name-based rule that separates "a callee dynamo chose to
+        # convert" from "a different region's code": both are frames whose name
+        # is not the permit's. So this reports and counts, and does not abort.
+        # What it catches is stated on `_attribution_mismatch`.
+        #
+        # The module filter keeps it quiet and meaningful: a frame from a
+        # DIFFERENT module than the permit's region is unambiguously a callee,
+        # so it is skipped. A frame from the SAME module with a different name
+        # is the one case worth reporting.
+        if permit.frames_traced == 1 and not permit.reported:
+            if _same_module(frame, permit.region):
+                mismatch = _attribution_mismatch(frame, permit.region)
+                if mismatch is not None:
+                    permit.reported = True
+                    ATTRIBUTION_MISMATCHES.append(mismatch)
+                    logger.error(
+                        "trace gate: the first frame converted under a permit does "
+                        "not look like the region that minted it (advisory, not "
+                        "fatal).\n"
+                        "  converting:    %s\n"
+                        "  permit region: %s\n"
+                        "  permit key:    %s\n"
+                        "  why not:       %s\n"
+                        "  This is reported, not refused: a callee of the region "
+                        "can be converted under its permit, and no name-based rule "
+                        "can tell that apart from a wrong region.",
+                        what, _fmt_region(permit.region), _fmt_key(permit.key),
+                        mismatch)
 
     @staticmethod
     def held() -> tuple[str, str] | None:
@@ -456,7 +634,11 @@ def _make_wrapper(original: Any) -> Any:
 
     @functools.wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        TraceGate.assert_permitted(_locate_frame(args, kwargs))
+        # The frame OBJECT is passed as well as its description: the gate has to
+        # compare the frame's name against the permit's region, and a formatted
+        # string cannot be compared reliably against a qualname.
+        frame = _find_frame(args, kwargs)
+        TraceGate.assert_permitted(_describe_frame(frame), frame=frame)
         return original(*args, **kwargs)
 
     setattr(wrapper, _WRAPPER_MARK, True)

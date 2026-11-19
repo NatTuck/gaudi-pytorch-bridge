@@ -24,6 +24,7 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include "backend/habana_operator.h"
 #include "backend/helpers/collective_kernel_info.h"
@@ -618,6 +619,33 @@ void region_probe_capture(
 
 // Runs the captured probe, if any. One relaxed atomic load when there is none.
 void region_probe_drain();
+
+// Thrown when a caller's arguments cannot be verified to belong in a recipe's
+// input slots, so the recipe is REFUSED instead of launched.
+//
+// WHY A DISTINCT TYPE RATHER THAN HABANA_ASSERT OR PT_SYNHELPER_FATAL. The
+// failure this replaces is measured, not hypothetical: a host pointer reaching
+// the launch table becomes a mem_handle with a handle index of ~3e7 against a
+// table of a few thousand, and PT_SYNHELPER_FATAL("Handle doesn't exist") is
+// raised from HandlesMap::CheckId (mem_handle.cpp:194) *inside* the device
+// memory mutex and the address lock. That leaves the recipe counter and the
+// defragmenter critical section half-updated, and the process then dies again in
+// HPUDeviceContext::garbage_collection_thread (boot-p4.log:1862) -- so the boot
+// cannot even report the first failure cleanly.
+//
+// This type is thrown by PrecompiledRegion::launch_from BEFORE anything has been
+// patched or launched, so nothing on the device is half-done and the caller can
+// turn it into a cache miss and re-trace, which is what it is for.
+//
+// HOW IT REACHES PYTHON. pybind11's default std::exception translator turns it
+// into RuntimeError with this type's name and message text, so
+// `except Exception` in recipe_consult.consult already catches it. Registering
+// it as its own Python exception would need a pybind registration in
+// recipe_compiler.cpp; that is deliberately not done here and is not needed.
+struct PrecompiledRegionBindingError : std::runtime_error {
+  explicit PrecompiledRegionBindingError(const std::string& message)
+      : std::runtime_error(message) {}
+};
 
 struct PrecompiledRegion {
   std::shared_ptr<RecipeHolder> holder_;

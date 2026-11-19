@@ -2337,12 +2337,455 @@ std::shared_ptr<PrecompiledRegion> PrecompiledRegion::load(
   return region;
 }
 
+namespace {
+
+// Only used to build refusal messages, so a name is worth more than a number and
+// a hand-written switch is worth more than depending on a torch helper that this
+// torch version may not export. The default covers the fp8/quantised spellings
+// this file never prints.
+const char* region_input_dtype_name(c10::ScalarType t) {
+  switch (t) {
+    case c10::ScalarType::Byte:
+      return "uint8";
+    case c10::ScalarType::Char:
+      return "int8";
+    case c10::ScalarType::Short:
+      return "int16";
+    case c10::ScalarType::Int:
+      return "int32";
+    case c10::ScalarType::Long:
+      return "int64";
+    case c10::ScalarType::Half:
+      return "float16";
+    case c10::ScalarType::Float:
+      return "float32";
+    case c10::ScalarType::Double:
+      return "float64";
+    case c10::ScalarType::Bool:
+      return "bool";
+    case c10::ScalarType::BFloat16:
+      return "bfloat16";
+    case c10::ScalarType::Float8_e5m2:
+      return "float8_e5m2";
+    case c10::ScalarType::Float8_e4m3fn:
+      return "float8_e4m3fn";
+    default:
+      return "a dtype this message does not name";
+  }
+}
+
+std::string region_input_shape_str(at::IntArrayRef shape) {
+  std::ostringstream os;
+  os << '[';
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i != 0) {
+      os << ", ";
+    }
+    os << shape[i];
+  }
+  os << ']';
+  return os.str();
+}
+
+// c10::Device is streamable (c10/core/Device.h:189) and prints as "hpu:0"/"cpu".
+// Done through a stringstream rather than c10::str so this file depends on
+// nothing this tree does not already use.
+std::string region_input_device_str(const c10::Device& device) {
+  std::ostringstream os;
+  os << device;
+  return os.str();
+}
+
+// The tail is on every refusal so that a reader of one log line knows both what
+// happened and what it implies. Nothing has been patched or launched when this
+// throws, so "re-trace" is a safe instruction rather than a hopeful one.
+std::string region_refusal_message(
+    const std::string& key,
+    const std::string& identity,
+    const std::string& detail) {
+  std::ostringstream os;
+  os << "PrecompiledRegionBindingError: region=" << key << " " << identity
+     << ": " << detail
+     << ". The caller's arguments could not be bound to this recipe's inputs, so "
+        "the recipe was REFUSED rather than launched with a tensor that cannot "
+        "be verified to belong in that slot. Nothing was patched and nothing was "
+        "launched; treat this as a cache miss and re-trace.";
+  return os.str();
+}
+
+[[noreturn]] void refuse_region_input(
+    const std::string& key,
+    size_t ridx,
+    const PtTensorInfo& ti,
+    const std::string& detail) {
+  std::ostringstream identity;
+  identity << "input=" << ridx << " (syn_name=" << ti.get_syn_name()
+           << " ir_name=" << ti.get_ir_name() << ")";
+  throw PrecompiledRegionBindingError(
+      region_refusal_message(key, identity.str(), detail));
+}
+
+[[noreturn]] void refuse_region_arity(
+    const std::string& key,
+    size_t walked,
+    size_t recorded) {
+  std::ostringstream detail;
+  detail << "arity mismatch: walking the supplied arguments against the recipe's "
+            "tensor-info table consumed "
+         << walked << " input slot(s) but the recipe records " << recorded;
+  throw PrecompiledRegionBindingError(
+      region_refusal_message(key, "inputs", detail.str()));
+}
+
+// True for the one case `update_patching_table` does not patch at all: a constant
+// tensor with empty storage. Its launch address stays 0, so there is nothing to
+// bind and nothing to verify -- and validating it would refuse a launch the
+// plugin's own path accepts. The predicate is copied from
+// update_patching_table (~:826) rather than invented, so the two agree about
+// which slots exist.
+bool region_input_is_unpatched_const(const at::Tensor& tensor) {
+  auto* tmeta{habana::get_tensor_extra_meta(tensor)};
+  if (!tmeta->has_valid_const_id()) {
+    return false;
+  }
+  return tensor.unsafeGetTensorImpl()->storage().nbytes() == 0;
+}
+
+// Validate one caller-supplied tensor against recipe input `ridx`, and return the
+// tensor that should actually be patched and launched. `allow_coerce` is false
+// only for the tensor-list path, where rebuilding the list is not implemented.
+at::Tensor bind_one_region_input(
+    const std::string& key,
+    size_t ridx,
+    const PtTensorInfo& ti,
+    const at::Tensor& supplied,
+    bool allow_coerce) {
+  // (1a) SHAPE FIRST, AND REFUSE.
+  //
+  // The binding is positional: update_patching_table walks dtensorinfos with a
+  // running index, and the recipe carries no per-input name the caller could
+  // match on (ir_name is a tensor debug name, not an argument name). So a shape
+  // mismatch is the only evidence available that argument `ridx` is not recipe
+  // input `ridx`, and it is real evidence: coercing past it would put a different
+  // tensor in the slot, move it to the right device, and produce a wrong weight
+  // with no error anywhere. Refusing costs a re-trace; coercing costs a model.
+  //
+  // Note that this must run BEFORE update_patching_table, and not merely before
+  // the launch: update_patching_table calls ti.set_shape(actual), so it OVERWRITES
+  // the recorded shape. Validating afterwards would compare the second call
+  // against the first call's argument and accept anything the first call accepted.
+  // Validating first also means the recorded shape is only ever replaced by an
+  // equal one, so no snapshot of the loaded metadata is needed.
+  // A VIEW, NOT A REFERENCE BINDING. `ti.get_shape()` returns
+  // `const std::vector<int64_t>&`, and binding a reference variable to a
+  // ref-returning call is the shape of expression GCC 13's -Wdangling-reference
+  // misreports (GCC bug 107532; see common/warning_suppress.h:31-41). An
+  // IntArrayRef is a value -- a pointer and a length -- so there is no reference
+  // to dangle, and no copy either. `ti` outlives this view. Same construction as
+  // backend/helpers/tensor_info.cpp:54.
+  const at::IntArrayRef expected_shape{ti.get_shape()};
+  const at::IntArrayRef actual_shape = supplied.sizes();
+  bool shape_matches = (actual_shape.size() == expected_shape.size());
+  for (size_t i = 0; shape_matches && i < expected_shape.size(); ++i) {
+    shape_matches = (actual_shape[i] == expected_shape[i]);
+  }
+  if (!shape_matches) {
+    refuse_region_input(
+        key,
+        ridx,
+        ti,
+        "shape mismatch: the recipe recorded " +
+            region_input_shape_str(expected_shape) + " but the launch supplied " +
+            region_input_shape_str(actual_shape) +
+            ", so there is no evidence that this argument is recipe input " +
+            std::to_string(ridx));
+  }
+
+  // (1b) DEVICE COERCION ONLY. A DTYPE MISMATCH IS REFUSED, NOT CAST.
+  //
+  // WHY DTYPE IS NO LONGER COERCED, AND THIS IS NOT A TIDY-UP. Coercing dtype
+  // makes a misbinding SILENT that would otherwise be loud. `_lm_head_quantize_
+  // chunk` is the measured case: its input 0 is the bf16 weight
+  // `bf16[rows,5120]` and its input 1 is the fp8 output `f8e4m3fn[rows,5120]`
+  // (`ops/hpu_lm_head_fp8.py:87-125`, artifacts `015c7180` / `1d1ea4b8`). The two
+  // have the SAME shape, so a swapped binding passes (1a) -- and a dtype
+  // coercion would then cast the bf16 weight to fp8 and write it, turning a
+  // detectable misbinding into corrupted weights with no error anywhere.
+  //
+  // AND THE COERCION WAS NEVER NEEDED. Across all 47 artifacts in the measured
+  // cache whose source is a hoisted `%_to_copy`, the distinct
+  // (dest dtype, src dtype) pairs are only (bf16,bf16), (f32,bf16) and
+  // (f8e4m3fn,f8e4m3fn): the `_to_copy` was a PURE DEVICE MOVE in every measured
+  // case, never a dtype cast. So device-only coercion loses nothing, and removing
+  // the dtype path removes the only way this patch can manufacture silence.
+  //
+  // The device coercion itself is still what reproduces the hoisted
+  // `aten._to_copy` that AOTAutograd's `CompiledFunction` performs before the
+  // graph runs -- the step the trace-free path was missing. For
+  // `_copy_weight_flat` it turns the CPU `loaded_weight` into the HPU
+  // `%_to_copy_default` the recipe expects.
+  //
+  // A COPY, NOT A REFERENCE BINDING -- same reason as expected_shape above:
+  // `ti.get_topts()` returns `const c10::TensorOptions&` and a reference variable
+  // bound to a ref-returning call is the pattern -Wdangling-reference misreports
+  // on this compiler. TensorOptions is a small trivially-copyable struct, and the
+  // existing code in this file already copies it (`at::TensorOptions
+  // topts(ti.get_topts());`, :952).
+  const c10::TensorOptions recorded(ti.get_topts());
+  const c10::Device target_device =
+      recorded.has_device() ? recorded.device() : supplied.device();
+  const c10::ScalarType target_dtype = recorded.has_dtype()
+      ? recorded.dtype().toScalarType()
+      : supplied.scalar_type();
+  if (supplied.scalar_type() != target_dtype) {
+    refuse_region_input(
+        key,
+        ridx,
+        ti,
+        "dtype mismatch: the recipe input is " +
+            std::string(region_input_dtype_name(target_dtype)) + " but the launch "
+            "supplied " + region_input_dtype_name(supplied.scalar_type()) +
+            ". A differing dtype is the one signal available when two inputs have "
+            "the same shape, so it is refused rather than cast: coercing it would "
+            "turn a detectable misbinding into a silently corrupted tensor");
+  }
+  at::Tensor bound = supplied;
+  if (supplied.device() != target_device) {
+    if (!allow_coerce) {
+      refuse_region_input(
+          key,
+          ridx,
+          ti,
+          "the recipe input is on " + region_input_device_str(target_device) +
+              " but the launch supplied " + region_input_device_str(supplied.device()) +
+              ", and coercion is not implemented for a tensor-list argument");
+    }
+    // `to(device, dtype)` rather than `to(device)`: the dtype is passed as the
+    // scalar type it already has, so this is provably a device move and nothing
+    // else, and it uses an overload whose existence is checked in this torch
+    // (`Tensor::to(Device, ScalarType, ...)`, ATen/core/TensorBody.h:4034).
+    bound = supplied.to(target_device, supplied.scalar_type());
+    PT_BRIDGE_DEBUG(
+        "PrecompiledRegion ", key, " input ", ridx, " (", ti.get_ir_name(),
+        ") coerced from ", supplied.device(), "/",
+        region_input_dtype_name(supplied.scalar_type()), " to ", bound.device(),
+        "/", region_input_dtype_name(bound.scalar_type()),
+        " to reproduce the graph input the recipe was compiled against");
+  }
+
+  // (1c) THE HARD CHECK, AFTER COERCION.
+  //
+  // A DATA_TENSOR recipe input is a DEVICE tensor: its address goes into
+  // synLaunchTensorInfo.pTensorAddress (hpu_habana_cache.cpp:1524) and from there
+  // into device_memory::get_total_memory_required, which converts it with
+  // mem_handle::reinterpret_from_pointer and calls HandlesMap::GetPtrSize ->
+  // CheckId. A host pointer there is "Handle doesn't exist" at
+  // mem_handle.cpp:194, raised inside the device memory mutex and the address
+  // lock, which is why the process then dies a second time in
+  // HPUDeviceContext::garbage_collection_thread. Checking here converts that into
+  // a named exception thrown before anything is patched.
+  //
+  // DATA_TENSOR_DYNAMIC is included because patch_launch_info treats the two
+  // identically (`case DATA_TENSOR: case DATA_TENSOR_DYNAMIC:`, :1518-1519), so
+  // both put a device address in the launch table. HOST_TO_DEVICE_TENSOR is
+  // deliberately NOT included: its address is the host pointer by design and
+  // graph::launch routes it through host_address_map instead (:842-849).
+  if ((ti.tensor_type() == DATA_TENSOR || ti.tensor_type() == DATA_TENSOR_DYNAMIC) &&
+      bound.device().type() != c10::DeviceType::HPU) {
+    refuse_region_input(
+        key,
+        ridx,
+        ti,
+        "the recipe input is a DATA_TENSOR, which is a device tensor, but after "
+        "coercion the launch would supply " +
+            region_input_device_str(bound.device()) + " (recorded " +
+            (recorded.has_device() ? region_input_device_str(recorded.device()) : "no device") +
+            "/" + region_input_dtype_name(target_dtype) + ", supplied " +
+            region_input_device_str(supplied.device()) + "/" +
+            region_input_dtype_name(supplied.scalar_type()) +
+            "). A host pointer in the launch table becomes an out-of-range "
+            "mem_handle index and HandlesMap::CheckId raises \"Handle doesn't "
+            "exist\" (mem_handle.cpp:194) inside the address lock");
+  }
+
+  return bound;
+}
+
+// Bind every caller-supplied argument to the recipe's inputs, replacing `bound`
+// in place where a coercion is needed.
+//
+// THE WALK MUST BE IDENTICAL TO update_patching_table's (~:810-887), or the index
+// validated here is not the index that gets patched: a tensor IValue consumes one
+// tensor-info slot, a tensor-list IValue consumes one per element, and every other
+// IValue (int, float, Scalar, bool -- the specialised Python constants these
+// region bodies take) consumes none.
+//
+// TWO PASSES, AND ARITY IS PASS ONE. This is the ordering the `_init_normal`
+// finding forces, and it is not a micro-optimisation:
+//
+//   * A recipe whose first inputs are the framework's RNG seed and counter
+//     (`%seed_pl`, `%counter_pl`) cannot be served from the trace-free path AT
+//     ALL -- `GraphExec::UpdateSeedTensors` (habana_eager/graph_exec.cpp:1009-1034)
+//     writes those two slots from device RNG state under the comment "Those are
+//     tensors not passed from user", so they are not caller arguments and no
+//     caller can supply them.
+//   * The shape check only catches such a recipe BY ACCIDENT: it refuses
+//     `_init_normal` because the seed's recorded shape `[]` happens not to match
+//     the destination's `[2304,1152]`. A 0-dim destination -- a legitimate
+//     region -- would match the seed's shape and slip through to the arity check
+//     anyway, so the accidental catch is not a guarantee.
+//   * Arity is the fundamental test: it asks "does this recipe want the same
+//     NUMBER of tensor inputs the caller has", which is exactly the property a
+//     framework-injected input breaks. So it runs first, and a mismatch is
+//     reported as an arity mismatch rather than as a shape mismatch on input 0.
+//
+// Pass one counts slots and never touches an individual tensor's shape; pass two
+// binds and validates. Counting is unaffected by the const-id skip below,
+// because `update_patching_table` advances `ridx` for a skipped const tensor too
+// (it is counted in `num_inputs`, it is simply not patched).
+void bind_region_inputs(
+    const std::string& key,
+    const RecipeValueSpec& rvs,
+    std::vector<habana_torch::jit::IValue>& bound) {
+  const size_t recorded_inputs = rvs.num_inputs;
+
+  // ---- PASS ONE: ARITY. -------------------------------------------------
+  // Counted with `size()` rather than a range-for over the list: the count is
+  // all this pass needs, and a loop here would be a second `c10::List`
+  // iteration needing the same suppression for no benefit.
+  size_t consumed = 0;
+  for (const auto& input : bound) {
+    if (input.isTensor()) {
+      ++consumed;
+    } else if (input.isTensorList()) {
+      consumed += input.toTensorList().size();
+    }
+    // Anything else consumes no tensor-info slot, exactly as in
+    // update_patching_table.
+  }
+  if (consumed != recorded_inputs) {
+    refuse_region_arity(key, consumed, recorded_inputs);
+  }
+
+  // ---- PASS TWO: BIND AND VALIDATE. -------------------------------------
+  size_t ridx = 0;
+  for (auto& input : bound) {
+    if (input.isTensor()) {
+      const at::Tensor tensor = input.toTensor();
+      // `ridx < recorded_inputs` is guaranteed by pass one, and
+      // `dtensorinfos.size() >= num_inputs`, so this index is in range. The
+      // guard is kept as a safety net rather than an assertion.
+      if (ridx >= rvs.dtensorinfos.size()) {
+        refuse_region_arity(key, ridx + 1, recorded_inputs);
+      }
+      if (region_input_is_unpatched_const(tensor)) {
+        // Not patched by update_patching_table, so nothing to bind and nothing
+        // to verify -- but the slot is still consumed.
+        ++ridx;
+        continue;
+      }
+      const PtTensorInfo& ti = *rvs.dtensorinfos[ridx];
+      input = habana_torch::jit::IValue(
+          bind_one_region_input(key, ridx, ti, tensor, /*allow_coerce=*/true));
+      ++ridx;
+    } else if (input.isTensorList()) {
+      // Validated element by element so the index arithmetic stays right, but not
+      // coerced: rebuilding a c10::List<at::Tensor> here would be code that only
+      // ever runs on a path no region in the measured population takes, and a
+      // wrong rebuild would be worse than a refusal. bind_one_region_input
+      // refuses instead when a list element would have needed coercion.
+      //
+      // THE LIST IS NAMED, AND THE LOOP IS WRAPPED IN THE TREE'S OWN SUPPRESSION.
+      // Both, because they address different halves of the problem.
+      //   * `toTensorList()` returns a c10::List<at::Tensor> BY VALUE, so the
+      //     range expression is a temporary. Naming it removes that.
+      //   * It is NOT enough on its own. Iterating a c10::List binds
+      //     `const at::Tensor&` to the result of the list iterator's operator*,
+      //     and GCC 13's -Wdangling-reference reports that as possibly dangling
+      //     (GCC bug 107532) even when the list is a named local -- see
+      //     habana_eager/kernels_impl.cpp:107/119, which names the list
+      //     (`auto grads = stack[0].toTensorList();`) and still needs the macro.
+      //     This tree builds with -Werror (cmake/Targets.cmake:47), so the
+      //     warning is fatal.
+      //   * The macro wraps only the `for (...)` header, not the body, exactly as
+      //     update_patching_table does at :860, so the suppression covers the one
+      //     expression that needs it and nothing else.
+      const auto tensor_list = input.toTensorList();
+      SUPPRESS_WDANGLING_REFERENCE(
+          for (const at::Tensor& t : tensor_list)) {
+        if (ridx >= rvs.dtensorinfos.size()) {
+          refuse_region_arity(key, ridx + 1, recorded_inputs);
+        }
+        if (region_input_is_unpatched_const(t)) {
+          ++ridx;
+          continue;
+        }
+        const PtTensorInfo& ti = *rvs.dtensorinfos[ridx];
+        (void)bind_one_region_input(key, ridx, ti, t, /*allow_coerce=*/false);
+        ++ridx;
+      }
+    }
+    // Anything else consumes no tensor-info slot, exactly as in
+    // update_patching_table.
+  }
+  if (ridx != recorded_inputs) {
+    refuse_region_arity(key, ridx, recorded_inputs);
+  }
+}
+
+} // namespace
+
 torch::jit::Stack PrecompiledRegion::launch_from(
     synapse_helpers::hpuStream_t stream,
     at::ArrayRef<habana_torch::jit::IValue> input_refs,
     std::vector<at::Tensor>& outputs) {
   RecipeValueSpec& rvs = *holder_->rvs_;
   RecipeLauncher& rl = *holder_->rl_;
+
+  // ---- 0. BIND THE CALLER'S ARGUMENTS TO THE RECIPE'S INPUTS, OR REFUSE. ----
+  //
+  // This is the fix for the "Handle doesn't exist" launch failure, and it is the
+  // boundary where a Python argument is handed to a recipe, which is the only
+  // place the mistake could be caught before it reaches the device.
+  //
+  // WHAT WAS ACTUALLY WRONG. A region's *arguments* are not a recipe's *inputs*.
+  // `torch.compile` hoists `aten._to_copy` for a CPU argument out of the compiled
+  // graph and makes its result a graph input -- HPU's own backend documents
+  // exactly that shape of graph (`compile_backend/_helpers/helpers.py:435`, a
+  // forward whose signature is `(self, mm, relu, _to_copy_1)`). So the compiled
+  // graph's input 1 is the HPU tensor, and the CPU->HPU copy is performed by
+  // AOTAutograd's `CompiledFunction` wrapper BEFORE the graph runs. The
+  // trace-free path never enters `CompiledFunction`, so it handed the recipe the
+  // CPU tensor instead: `_copy_weight_flat`'s `src` is `loaded_weight` straight
+  // out of the safetensors iterator, and the recipe's input is named
+  // `%_to_copy_default` because that is the hoisted node that produced it.
+  //
+  // Measured, over all 40 artifacts in the cache this was diagnosed from: every
+  // region that receives a CPU tensor has a `%_to_copy_default` input, and every
+  // region whose tensor arguments are all already on HPU does not. So this is not
+  // a special case for one body; it is the calling convention of every
+  // weight-loading region.
+  //
+  // WHY IT SURFACED AS A HANDLE ERROR AND NOT A DEVICE ERROR. PtTensorInfo
+  // records no addresses (`tensor_info.cpp:189-247`), so the address is re-derived
+  // per launch by patch_exact, which stores `pt_tensor.data_ptr()` verbatim. For a
+  // CPU tensor of the same shape and dtype as the recipe's input, patch_exact's
+  // own guard (`offset_ == new_offset`, 0 == 0) passes, nothing between there and
+  // graph::launch looks at the device, and the host pointer is emitted as
+  // synLaunchTensorInfo.pTensorAddress. `device_memory::get_total_memory_required`
+  // then converts it with `mem_handle::reinterpret_from_pointer` and calls
+  // `GetPtrSize` -> `CheckId`, and any userspace host pointer yields a handle
+  // index around 3e7 against a table of a few thousand. Deterministic, not a race.
+  std::vector<habana_torch::jit::IValue> bound_inputs(
+      input_refs.begin(), input_refs.end());
+  bind_region_inputs(key_, rvs, bound_inputs);
+  // `update_patching_table` takes a non-const ArrayRef lvalue, so this has to be
+  // a named local rather than a temporary. It views `bound_inputs`, which is
+  // alive for the whole function, and it is the SAME list handed to
+  // RecipeLauncher::Launch -- patching and launching must see the same tensors or
+  // patch_exact's addresses would belong to tensors Launch never holds.
+  at::ArrayRef<habana_torch::jit::IValue> bound_refs(
+      bound_inputs.data(), bound_inputs.size());
 
   // The two patching calls plus the launch: exactly the plugin's cache-hit path,
   // with the RecipeHolder coming from a file instead of from graph_compile.
@@ -2354,7 +2797,7 @@ torch::jit::Stack PrecompiledRegion::launch_from(
   // graph is the only source of).
   habana::IdShapeMap actual_shapes;
   rvs.update_patching_table(
-      input_refs, intermediates, dma_inputs, aten_outputs, actual_shapes);
+      bound_refs, intermediates, dma_inputs, aten_outputs, actual_shapes);
 
   std::vector<synLaunchTensorInfo> syn_launch_info;
   std::vector<size_t> external_tensor_info_indexes;
@@ -2364,7 +2807,7 @@ torch::jit::Stack PrecompiledRegion::launch_from(
 
   rl.Launch(
       stream,
-      input_refs,
+      bound_refs,
       intermediates,
       aten_outputs,
       syn_launch_info,
