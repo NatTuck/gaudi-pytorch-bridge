@@ -35,6 +35,7 @@ the lowering changed.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import logging
 import os
@@ -227,16 +228,28 @@ def build(*, instance: tuple, region: tuple, shapes: tuple) -> CompileInputs:
 
 
 # ---------------------------------------------------------------------------
-# Code identity: a normalised-AST hash of the region and its in-file closure
+# Code identity: a normalised-AST hash of the region and its INLINED source
 # ---------------------------------------------------------------------------
+#
+# The identity covers the region and every PROJECT function that is inlined into
+# it -- across files, because a region's graph is built from everything dynamo
+# inlines, not from one file. It never covers library code: a callee whose source
+# is outside `_PROJECT_ROOTS` is opaque by design and identified by version, which
+# is the existing rule for library code.
 
 # Directories whose source participates in the identity. Anything else (torch,
-# stdlib, Synapse) is opaque and is identified by version instead.
+# stdlib, C extensions, installed packages, Synapse) is opaque.
 _PROJECT_ROOTS = ("vllm-gaudi", "vllm-core", "gaudi-pytorch-bridge")
 
-# (path, mtime) -> parsed Module. A repeat call for the same file must NOT re-parse:
-# that is what the counter assertion below is for.
-_PARSE_CACHE: dict[tuple[str, float], object] = {}
+# (path, st_mtime_ns, st_size) -> parsed Module. A repeat call for an UNCHANGED
+# file must not re-parse: that is what the counter assertion below is for.
+#
+# mtime AND SIZE, not mtime alone. Two writes to one path inside a single kernel
+# timestamp tick can share an mtime, and an mtime-keyed cache then serves the
+# previous tree -- which is how a test for "no memoisation" can pass or fail by
+# luck. Size closes the common half of that hole (a rewrite that changes length);
+# `st_mtime_ns` closes the rest as far as the filesystem reports it.
+_PARSE_CACHE: dict[tuple[str, int, int], object] = {}
 _PARSE_COUNT = 0
 
 
@@ -248,48 +261,70 @@ def parse_count() -> int:
 def reset_parse_cache() -> None:
     """Test seam: drop the parse cache and the counter.
 
-    This does NOT drop `_IDENTITY_CACHE`: a memoised digest is a complete answer
-    for that function OBJECT, so it is not a parse-cache entry. A test that needs
-    the walk to run again for the same object calls `reset_identity_cache()`.
+    There is no identity memo to drop: `code_identity` recomputes the digest from
+    source on every call (see the note beside `_PARSE_CACHE`). Clearing this cache
+    therefore forces a real re-parse, which is what a test wants after it rewrites
+    a file.
     """
     global _PARSE_COUNT
     _PARSE_CACHE.clear()
     _PARSE_COUNT = 0
 
 
-# id(fn) -> (fn, digest). Keyed on the FUNCTION OBJECT's identity and holding a
-# STRONG reference to it, so a recycled `id` cannot produce a stale hit -- the
-# same discipline as `_LOCATION_CACHE`. The walk below costs ~284 us/call and the
-# consult runs once per region call (~12,000 per boot), so an unregistered
-# `torch.compile` target would otherwise pay it on every single call.
+# THERE IS NO MEMO FOR THE DIGEST, DELIBERATELY. One existed -- `_IDENTITY_CACHE`
+# plus a `reset_identity_cache()` test seam -- and was REMOVED. It was keyed on the
+# FUNCTION OBJECT (`id(fn)` plus an identity check), not on the source. A function
+# object cannot change, but its source FILE can, so the memo could return a digest
+# for source that is no longer on disk: exactly the "accepting invalid data" this
+# module exists to prevent. It also hid the cost of the work the key is supposed to
+# do. Do not re-add it as an optimisation; the digest is computed from source on
+# every call, including the cross-file walk.
 #
-# NOTHING MUTABLE IS IN THE KEY. `code_identity` is a pure function of the
-# function object (its `__code__.co_filename` and its in-file closure), and the
-# file is re-read only through the parse cache, which is mtime-keyed. A function
-# object cannot change its source, so the memo cannot go stale for a live `fn`.
-_IDENTITY_CACHE: dict[int, tuple] = {}
-
-
-def reset_identity_cache() -> None:
-    """Test seam: drop the code-identity memo."""
-    _IDENTITY_CACHE.clear()
+# `_PARSE_CACHE` is NOT the same thing and stays: it is keyed on (path, mtime, size),
+# so a changed file is re-parsed, and it caches PARSING rather than the identity.
 
 
 def _in_project(path: str) -> bool:
     return any(root in path for root in _PROJECT_ROOTS)
 
 
+def _project_relative(path: str):
+    """The path from the matched project root onward, or None if external.
+
+    This is the identity's file name. It is NOT the absolute path: a digest that
+    embedded one would differ between checkouts, between machines, and between two
+    identical trees in different directories, which would make the recipe cache
+    useless and would make "same graph, same digest" untestable.
+    """
+    if not path:
+        return None
+    flat = path.replace(os.sep, "/")
+    for root in _PROJECT_ROOTS:
+        marker = "/" + root + "/"
+        at = flat.find(marker)
+        if at != -1:
+            return flat[at + 1:]
+        if flat.startswith(root + "/"):
+            return flat
+    # `_in_project` is a plain substring check; agree with it rather than
+    # disagreeing about an unusual path.
+    for root in _PROJECT_ROOTS:
+        at = flat.find(root)
+        if at != -1:
+            return flat[at:]
+    return None
+
+
 def _parse(path: str):
-    """Parse `path`, cached by (path, mtime). Counts real parses."""
+    """Parse `path`, cached by (path, st_mtime_ns, st_size). Counts real parses."""
     global _PARSE_COUNT
     import ast
-    import os
 
     try:
-        mtime = os.path.getmtime(path)
+        st = os.stat(path)
     except OSError:
         return None
-    key = (path, mtime)
+    key = (path, st.st_mtime_ns, st.st_size)
     hit = _PARSE_CACHE.get(key)
     if hit is not None:
         return hit
@@ -327,103 +362,814 @@ def _strip_docstrings(node):
     return node
 
 
-def _module_functions(tree) -> dict:
-    """Every resolvable callable in one module, by name: top-level AND methods.
+# Names that exist in every module without a binding statement. Not callees.
+_IMPLICIT_MODULE_NAMES = frozenset((
+    "__name__", "__file__", "__doc__", "__package__", "__spec__", "__loader__",
+    "__builtins__", "__path__", "__debug__", "__dict__", "__class__", "__all__",
+    "__annotations__", "__module__", "__qualname__",
+))
 
-    Top-level functions take precedence on a name collision, so the 33 module-level
-    regions resolve exactly as before -- `setdefault` is what preserves that.
+# ---------------------------------------------------------------------------
+# Bindings: what a name MEANS, not what it is called
+# ---------------------------------------------------------------------------
+#
+# Resolution is by BINDING. A bare name is classified, in this order:
+#   * local to the function (parameter, assignment, inner def, inner import) -> skip
+#   * defined at module scope in this file                                  -> inline
+#   * bound by an import: in-project module/symbol                          -> inline
+#                         external (torch, stdlib, C ext, installed)        -> skip
+#   * a builtin or a module dunder                                          -> skip
+#   * nothing anywhere                                                      -> CRASH
+#
+# THERE IS NO LAST-RESORT SEARCH. An earlier version, when a bare name had no
+# binding, searched the region's own directory tree for a definition of that name.
+# That was removed: it let a name with no real binding resolve to something, which
+# is the "accept invalid data" this module exists to prevent. A name that is not
+# local, not module-level, not imported and not a builtin has NO BINDING, and the
+# answer is to crash naming the call site -- never to guess where it might live.
+#
+# Attributes are resolved only where the base is statically known: `self.x` /
+# `cls.x` inside a class resolves in that class and its in-project bases, and
+# `module.x` resolves when `module` is an in-project import. An attribute on any
+# other value is opaque -- `self.model(...)` is an instance attribute assigned in
+# `__init__`, which no AST walk can see -- and is skipped rather than guessed at.
 
-    Methods are included because the MODEL FORWARD is a method, not a module-level
-    function. `code_identity` could not see it, and that blocked keying the model
-    forward at `hpu_model_runner.py:1791`. The walk below is the same one; it just
-    descends one level into class bodies.
+
+class _Module:
+    """One parsed file, indexed. Built per call; never cached across calls."""
+
+    __slots__ = ("path", "relpath", "tree", "defs", "classes", "bindings", "stars",
+                 "module_members", "_package")
+
+    def __init__(self, path, tree):
+        self.path = path
+        self.relpath = _project_relative(path) or path
+        self.tree = tree
+        self.defs = {}          # qualpath tuple -> {member name: node}, built lazily
+        self.classes = {}       # qualpath tuple -> ClassDef node
+        self.bindings = {}      # name -> [(kind, payload)] ; kind in def/import/node
+        self.stars = []         # dotted modules imported with `*`
+        self.module_members = {}  # name -> node for module-level defs and classes
+        self._package = False   # False = not computed yet
+
+    def members(self, qualpath):
+        """The members of the class at `qualpath`, or the module's own defs.
+
+        LAZY, and only ever within one walk: a class body is indexed when it is
+        looked up, not when the file is read. Indexing every class in a 2,000-line
+        model file to resolve one `self.attr` was most of the walk's cost.
+        """
+        if qualpath == ():
+            return self.module_members
+        cached = self.defs.get(qualpath)
+        if cached is not None:
+            return cached
+        members = {}
+        node = self.classes.get(qualpath)
+        if node is not None:
+            for stmt in node.body:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    members.setdefault(stmt.name, stmt)
+                elif isinstance(stmt, ast.ClassDef):
+                    members.setdefault(stmt.name, stmt)
+                    self.classes.setdefault(qualpath + (stmt.name,), stmt)
+                elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    # A CLASS-LEVEL ASSIGNMENT IS AN INPUT. `self.SOME_CONST` read at
+                    # runtime changes the graph, and it is in-project source, so it is
+                    # a member: its statement is hashed like any other entry. Skipping
+                    # it left a constant that the graph depends on out of the key.
+                    for target in _assignment_targets(stmt):
+                        if isinstance(target, ast.Name):
+                            members.setdefault(target.id, stmt)
+        self.defs[qualpath] = members
+        return members
+
+    def bind(self, kind, name, payload):
+        self.bindings.setdefault(name, []).append((kind, payload))
+
+    def package(self):
+        """This file's dotted package, computed once per walk (None if unpackage d)."""
+        if self._package is False:
+            self._package = _package_for_file(self.path)
+        return self._package
+
+
+class _ModuleScopeVisitor(ast.NodeVisitor):
+    """Collect module-scope bindings, without entering function or class bodies.
+
+    Entering them would record a local assignment as a module binding, which both
+    over-covers (hashing unrelated nodes) and hides the unbound-name crash.
     """
-    import ast
 
-    out = {n.name: n for n in tree.body
-           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
+    def __init__(self, mod):
+        self.mod = mod
+
+    def visit_body(self, body):
+        for stmt in body:
+            self.visit(stmt)
+
+    def visit_FunctionDef(self, node):
+        self.mod.bind("def", node.name, node)
+        self.mod.module_members.setdefault(node.name, node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        self.mod.bind("def", node.name, node)
+        self.mod.module_members.setdefault(node.name, node)
+        self.mod.classes.setdefault((node.name,), node)
+
+    def visit_Lambda(self, node):
+        return
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            if alias.asname:
+                self.mod.bind("import", alias.asname, (alias.name, None))
+            else:
+                # `import a.b` binds the root package name `a`.
+                self.mod.bind("import", alias.name.split(".")[0], (alias.name, None))
+
+    def visit_ImportFrom(self, node):
+        dotted = self._dotted(node)
+        for alias in node.names:
+            if alias.name == "*":
+                if dotted:
+                    self.mod.stars.append(dotted)
+                continue
+            self.mod.bind("import", alias.asname or alias.name,
+                          (dotted, alias.name))
+
+    def _dotted(self, node):
+        """The absolute module a `from ... import` names, or None if unknown."""
+        if not node.level:
+            return node.module
+        base = self.mod.package()
+        if base is None:
+            return None
+        parts = [p for p in base.split(".") if p]
+        if node.level > 1:
+            parts = parts[:max(0, len(parts) - (node.level - 1))]
+        if node.module:
+            parts.extend(node.module.split("."))
+        return ".".join(parts) or None
+
+    def visit_Assign(self, node):
+        for target in node.targets:
+            self._bind_target(target, node)
+
+    def visit_AnnAssign(self, node):
+        self._bind_target(node.target, node)
+
+    def visit_AugAssign(self, node):
+        self._bind_target(node.target, node)
+
+    def visit_For(self, node):
+        self._bind_target(node.target, node)
+        self.generic_visit(node)
+
+    visit_AsyncFor = visit_For
+
+    def visit_With(self, node):
+        for item in node.items:
+            if item.optional_vars is not None:
+                self._bind_target(item.optional_vars, node)
+        self.generic_visit(node)
+
+    visit_AsyncWith = visit_With
+
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self.mod.bind("node", node.name, node)
+        self.generic_visit(node)
+
+    def _bind_target(self, target, stmt):
+        for child in ast.walk(target):
+            if isinstance(child, ast.Name):
+                self.mod.bind("node", child.id, stmt)
+
+
+def _build_index(path, tree):
+    mod = _Module(path, tree)
+    _ModuleScopeVisitor(mod).visit_body(tree.body)
+    return mod
+
+
+def _package_for_file(path):
+    """The dotted package of a file, for resolving relative imports.
+
+    Derived from the `__init__.py` chain on disk: O(depth) stat calls. The first
+    version scanned sys.modules and realpath'd every entry, which cost 340 stat
+    calls PER IDENTITY on a real model file -- 88% of the whole walk, measured --
+    and told us nothing the directory layout does not.
+
+    Returns None when the file is not inside a package. A relative import from a
+    file whose package cannot be named is then unresolvable, and unresolvable
+    imports are skipped (library code) rather than guessed at.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    parts = []
+    while os.path.isfile(os.path.join(directory, "__init__.py")):
+        parts.append(os.path.basename(directory))
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    if not parts:
+        return None
+    return ".".join(reversed(parts))
+
+
+def _is_self_attr(target, name):
+    """Whether `target` is the attribute `self.<name>`."""
+    return (isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+            and target.attr == name)
+
+
+def _assignment_targets(stmt):
+    """The Name targets of an assignment statement (module or class scope)."""
+    if isinstance(stmt, ast.Assign):
+        targets = []
+        for target in stmt.targets:
+            targets.extend(n for n in ast.walk(target) if isinstance(n, ast.Name))
+        return targets
+    if isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        return [n for n in ast.walk(stmt.target) if isinstance(n, ast.Name)]
+    return []
+
+
+def _symbol_node(mod, qualpath, name):
+    """The AST node for `name` at `qualpath`, or None."""
+    node = mod.members(qualpath).get(name)
+    if node is not None:
+        return node
+    if qualpath == ():
+        # A module-level assignment: hash the statement that binds it, so a
+        # changed constant is a changed digest.
+        for kind, payload in mod.bindings.get(name, ()):
+            if kind == "node":
+                return payload
+    return None
+
+
+def _module_file_for(dotted):
+    """The source file of a dotted module name, without importing anything."""
+    import sys
+
+    loaded = sys.modules.get(dotted)
+    if loaded is not None:
+        origin = getattr(loaded, "__file__", None)
+        return origin or None           # a namespace package has no file
+    relative = dotted.replace(".", os.sep)
+    for entry in sys.path:
+        if not entry:
             continue
-        for sub in node.body:
-            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                out.setdefault(sub.name, sub)
-    return out
+        base = os.path.join(entry, relative)
+        for candidate in (base + ".py", os.path.join(base, "__init__.py")):
+            if os.path.isfile(candidate):
+                return candidate
+    return None
 
 
-def _names_used(node) -> set:
-    """Every bare name and attribute base referenced inside `node`."""
-    import ast
+class _ScopeScanner(ast.NodeVisitor):
+    """Names bound in ONE function's own scope.
 
-    out = set()
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name):
-            out.add(child.id)
-        elif isinstance(child, ast.Attribute):
-            # The ATTRIBUTE NAME is the callee for `self.helper(x)`; collecting
-            # only the base would record `self` and miss every method-to-method
-            # call, which is precisely how the model forward calls its helpers.
-            out.add(child.attr)
-            base = child
+    Stops at nested functions, lambdas and classes: their internals are different
+    scopes, and treating their assignments as locals here would make an unrelated
+    inner assignment hide a real module-level callee.
+    """
+
+    def __init__(self):
+        self.bound = set()
+        self.declared_global = set()
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.bound.add(node.id)
+
+    def visit_arg(self, node):
+        self.bound.add(node.arg)
+
+    def visit_Global(self, node):
+        self.declared_global.update(node.names)
+
+    def visit_Nonlocal(self, node):
+        # Bound in an enclosing function: local as far as this file's module
+        # scope is concerned, so it is not a module-level callee.
+        self.bound.update(node.names)
+
+    def visit_FunctionDef(self, node):
+        self.bound.add(node.name)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        self.bound.add(node.name)
+
+    def visit_Lambda(self, node):
+        return
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.bound.add((alias.asname or alias.name).split(".")[0])
+
+    def visit_ImportFrom(self, node):
+        for alias in node.names:
+            if alias.name != "*":
+                self.bound.add(alias.asname or alias.name)
+
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self.bound.add(node.name)
+        self.generic_visit(node)
+
+
+def _local_names(fn_node):
+    """Everything bound in this function's own scope (args included)."""
+    scanner = _ScopeScanner()
+    args = fn_node.args
+    for arg in (list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)):
+        scanner.bound.add(arg.arg)
+    if args.vararg is not None:
+        scanner.bound.add(args.vararg.arg)
+    if args.kwarg is not None:
+        scanner.bound.add(args.kwarg.arg)
+    for stmt in fn_node.body:
+        scanner.visit(stmt)
+    return scanner.bound - scanner.declared_global
+
+
+def _refs(fn_node):
+    """References in one function's body.
+
+    Each is (kind, payload, line, is_call):
+      ("bare", name, line, is_call)
+      ("attr", (root, (a, b)), line, is_call)
+
+    `is_call` says the reference is the RECEIVER of a call. That distinction is
+    what separates "there is code behind this name" (a receiver: it must resolve,
+    or the walk is not hashing part of the graph) from "there is a value behind
+    this name" (a plain read: skipped when opaque).
+
+    The base Name of an attribute chain is reported as the CHAIN, never also as a
+    bare name: `torch.zeros` is an attribute on an external module, not a bare
+    `torch`. An attribute on a call result (`f().x`) is opaque and dropped.
+    """
+    root = ast.Module(body=list(fn_node.body), type_ignores=[])
+    call_funcs = {id(n.func) for n in ast.walk(root) if isinstance(n, ast.Call)}
+    attrs = [n for n in ast.walk(root) if isinstance(n, ast.Attribute)]
+    inner = set()
+    for node in attrs:
+        value = node.value
+        while isinstance(value, ast.Attribute):
+            inner.add(id(value))
+            value = value.value
+    chains = []
+    chain_bases = set()
+    for node in attrs:
+        if id(node) in inner:
+            continue
+        parts = []
+        base = node
+        while isinstance(base, ast.Attribute):
+            parts.append(base.attr)
+            base = base.value
+        if not isinstance(base, ast.Name):
+            continue
+        chain_bases.add(id(base))
+        chains.append(("attr", (base.id, tuple(reversed(parts))), node.lineno,
+                       id(node) in call_funcs))
+    bares = []
+    for node in ast.walk(root):
+        if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                and id(node) not in chain_bases):
+            bares.append(("bare", node.id, node.lineno, id(node) in call_funcs))
+    return chains + bares
+
+
+class _Walk:
+    """One identity computation: parse cache per call, seen-set, resolution."""
+
+    def __init__(self, region_label):
+        self.region_label = region_label
+        self.modules = {}       # path -> _Module  (per call, never across calls)
+        self.mod_for = {}       # dotted name -> _Module or None  (per call)
+        self.bases_of = {}      # (relpath, qualpath) -> bases       (per call)
+        self.instance_of = {}   # (relpath, qualpath, name) -> classes (per call)
+        self.seen = {}          # canonical entry -> node
+
+    # -- module access -----------------------------------------------------
+
+    def module(self, path):
+        mod = self.modules.get(path)
+        if mod is not None:
+            return mod
+        tree = _parse(path)
+        if tree is None:
+            return None
+        mod = _build_index(path, tree)
+        self.modules[path] = mod
+        return mod
+
+    def module_for(self, dotted):
+        """The _Module for a dotted import name, if its source is in-project.
+
+        NOTHING IS IMPORTED TO ANSWER THIS. `importlib.util.find_spec` was tried
+        and rejected: finding a DOTTED name imports its parent packages, so
+        resolving one import during key computation executed vllm's package
+        `__init__` and activated the HPU platform plugin -- a side effect in a
+        function whose whole job is to read source. Two side-effect-free sources
+        are used instead:
+
+          1. `sys.modules` -- and this is also the CORRECT source: a callee whose
+             module is not imported cannot be called at runtime, so a module the
+             region really calls is necessarily already loaded.
+          2. a path search over `sys.path` for the remaining names (a module that
+             is on disk but not yet imported), which touches only the filesystem.
+        """
+        if not dotted:
+            return None
+        if dotted in self.mod_for:
+            return self.mod_for[dotted]
+        found = self._module_for_uncached(dotted)
+        self.mod_for[dotted] = found
+        return found
+
+    def _module_for_uncached(self, dotted):
+        path = _module_file_for(dotted)
+        if not path or not path.endswith(".py"):
+            return None
+        if not _in_project(path):
+            return None                     # external: opaque by design
+        return self.module(path)
+
+    # -- class members -----------------------------------------------------
+
+    def class_member(self, mod, qualpath, attr, seen=None):
+        """[(mod, containing qualpath, name)] for `attr` on the class at `qualpath`."""
+        seen = set() if seen is None else seen
+        key = (mod.relpath, qualpath, attr)
+        if key in seen:
+            return []
+        seen.add(key)
+        out = []
+        if attr in mod.members(qualpath):
+            out.append((mod, qualpath, attr))
+        for base_mod, base_qp in self.bases(mod, qualpath):
+            out.extend(self.class_member(base_mod, base_qp, attr, seen))
+        return out
+
+    def bases(self, mod, qualpath):
+        """[(mod, qualpath)] for the in-project bases of the class at `qualpath`."""
+        key = (mod.relpath, qualpath)
+        if key in self.bases_of:
+            return self.bases_of[key]
+        found = self._bases_uncached(mod, qualpath)
+        self.bases_of[key] = found
+        return found
+
+    def _bases_uncached(self, mod, qualpath):
+        node = mod.classes.get(qualpath)
+        if node is None:
+            return []
+        out = []
+        for base in node.bases:
+            if not isinstance(base, ast.Name):
+                continue                     # `nn.Module`: external, opaque
+            for target in self.bare_targets(mod, base.id):
+                target_mod, target_qp, target_name = target
+                member = _symbol_node(target_mod, target_qp, target_name)
+                if isinstance(member, ast.ClassDef):
+                    out.append((target_mod, target_qp + (target_name,)))
+        return out
+
+    def chain_in_class(self, mod, start_qp, parts):
+        """Walk `parts` from the class at `start_qp`.
+
+        A position is (module, class qualpath): the class whose namespace the next
+        part is looked up in. Three things can happen to a part:
+          * it is a member (method, nested class, class-level assignment) -> a final
+            entry when it is the last part, otherwise a new position when it is a
+            class, so `self.Inner.method` resolves;
+          * it is assigned in `__init__` to an in-project class -> a new position,
+            so `self.inner.forward` resolves to `Inner.forward`; a final entry when
+            it is the last part, since the class itself is then the code;
+          * neither -> this position yields nothing.
+        """
+        current = [(mod, start_qp)]
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            finals = []
+            following = []
+            for this_mod, qp in current:
+                for member_mod, member_qp, member_name in self.class_member(
+                        this_mod, qp, part):
+                    if last:
+                        finals.append((member_mod, member_qp, member_name))
+                    else:
+                        node = _symbol_node(member_mod, member_qp, member_name)
+                        if isinstance(node, ast.ClassDef):
+                            following.append((member_mod, member_qp + (member_name,)))
+                for inst_mod, inst_qp in self.init_instance(this_mod, qp, part):
+                    if last:
+                        finals.append((inst_mod, inst_qp[:-1], inst_qp[-1]))
+                    else:
+                        following.append((inst_mod, inst_qp))
+            if last:
+                return finals
+            if not following:
+                return []
+            current = following
+        return []
+
+    def init_instance(self, mod, qualpath, name):
+        """[(module, class qualpath)] for `self.<name> = <expr>` in this __init__.
+
+        BOUNDED ON PURPOSE. Only three forms resolve, exactly as specified: a call
+        to an in-project class (`Inner()`), an in-project class attribute, and a
+        module-qualified in-project name. No dataflow, no return-value tracking,
+        and only the FIRST assignment in `__init__` -- a later reassignment is not
+        analysed. Anything else (a parameter, a factory function, a subscript, a
+        literal) yields nothing, and the caller decides what that means.
+        """
+        key = (mod.relpath, qualpath, name)
+        cached = self.instance_of.get(key)
+        if cached is not None:
+            return cached
+        self.instance_of[key] = []          # cycle guard: never revisit
+        out = []
+        constructor = self.init_node(mod, qualpath)
+        if constructor is not None:
+            init_mod, init = constructor
+            # The expression is resolved in the namespace of the module that
+            # WRITES the __init__, which is not the class's module when __init__
+            # is inherited from a base in another file.
+            for stmt in ast.walk(ast.Module(body=list(init.body), type_ignores=[])):
+                value = None
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if _is_self_attr(target, name):
+                            value = stmt.value
+                            break
+                elif isinstance(stmt, ast.AnnAssign) and _is_self_attr(stmt.target, name):
+                    value = stmt.value
+                if value is not None:
+                    # FIRST assignment only: a later reassignment is not analysed.
+                    out = self.class_of_expr(init_mod, value)
+                    break
+        self.instance_of[key] = out
+        return out
+
+    def init_node(self, mod, qualpath):
+        """(module, __init__ node) for instances of this class: own, else inherited.
+
+        A class that does not define `__init__` is constructed by its base's, so
+        the assignment that binds `self.<attr>` may live in another file. That
+        module is returned with the node because the right-hand side must be
+        resolved in the namespace it was written in.
+        """
+        own = mod.members(qualpath).get("__init__")
+        if isinstance(own, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return mod, own
+        for base_mod, base_qp in self.bases(mod, qualpath):
+            found = self.init_node(base_mod, base_qp)
+            if found is not None:
+                return found
+        return None
+
+    def class_of_expr(self, mod, expr):
+        """[(module, class qualpath)] when `expr` denotes an in-project class."""
+        out = []
+        if isinstance(expr, ast.Call):
+            expr = expr.func
+        if isinstance(expr, ast.Name):
+            for target_mod, target_qp, target_name in self.bare_targets(mod, expr.id):
+                node = _symbol_node(target_mod, target_qp, target_name)
+                if isinstance(node, ast.ClassDef):
+                    out.append((target_mod, target_qp + (target_name,)))
+        elif isinstance(expr, ast.Attribute):
+            parts = []
+            base = expr
             while isinstance(base, ast.Attribute):
+                parts.append(base.attr)
                 base = base.value
             if isinstance(base, ast.Name):
-                out.add(base.id)
-    return out
+                for target_mod, target_qp, target_name in self.attr_targets(
+                        mod, base.id, tuple(reversed(parts))):
+                    node = _symbol_node(target_mod, target_qp, target_name)
+                    if isinstance(node, ast.ClassDef):
+                        out.append((target_mod, target_qp + (target_name,)))
+        return out
 
-
-def _closure(path: str, fn_name: str):
-    """The in-file transitive closure of `fn_name`, as a sorted list of (name, node).
-
-    BOUNDED TO ONE FILE BY MEASUREMENT: every compiled region's in-project closure
-    is exactly one file -- 56 regions, 19 files, zero closures spanning more than
-    one file. So no cross-file walk is needed, and a cross-file call is treated as
-    opaque rather than chased.
-    """
-    tree = _parse(path)
-    if tree is None:
-        return []
-    funcs = _module_functions(tree)
-    if fn_name not in funcs:
-        return []
-    seen = set()
-    queue = [fn_name]
-    while queue:
-        name = queue.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        node = funcs.get(name)
+    def walk_from_module(self, dotted, parts):
+        """Resolve `parts` starting at module `dotted`."""
+        if not parts:
+            return []
+        mod = self.module_for(dotted)
+        if mod is None:
+            return []
+        head, rest = parts[0], parts[1:]
+        sub = self.module_for(dotted + "." + head)
+        if sub is not None:
+            return self.walk_from_module(dotted + "." + head, rest) if rest else []
+        node = _symbol_node(mod, (), head)
         if node is None:
-            continue
-        for used in _names_used(node):
-            if used in funcs and used not in seen:
-                queue.append(used)
-    return [(name, funcs[name]) for name in sorted(seen)]
+            return []
+        if rest:
+            if isinstance(node, ast.ClassDef):
+                return self.chain_in_class(mod, (head,), rest)
+            return []
+        return [(mod, (), head)]
+
+    # -- name resolution ---------------------------------------------------
+
+    def bare_targets(self, mod, name, depth=0):
+        """Where a bare `name` is bound: [(mod, qualpath, name)]. Never raises."""
+        if depth > 8:
+            return []
+        out = []
+        for kind, payload in mod.bindings.get(name, ()):
+            if kind == "def":
+                out.append((mod, (), name))
+            elif kind == "node":
+                out.append((mod, (), name))
+            elif kind == "import":
+                dotted, symbol = payload
+                if symbol is None:
+                    # `import a.b` binds a module object; a module is not a callee.
+                    continue
+                if not dotted:
+                    # A relative import whose package could not be named. Skipped
+                    # rather than guessed: an unnameable package is library code
+                    # until proven otherwise.
+                    continue
+                source_mod = self.module_for(dotted)
+                if source_mod is not None:
+                    if (symbol in source_mod.bindings
+                            or symbol in source_mod.members(())):
+                        out.extend(self.bare_targets(source_mod, symbol, depth + 1))
+                        continue
+                    sub_mod = self.module_for(dotted + "." + symbol)
+                    if sub_mod is not None:
+                        out.append((sub_mod, (), symbol))   # `from pkg import sub`
+                    continue
+                # The parent module is external, so nothing under it is project
+                # source either: opaque by design.
+                continue
+        if not out:
+            for dotted in mod.stars:
+                star_mod = self.module_for(dotted)
+                if star_mod is not None and name in star_mod.bindings:
+                    out.extend(self.bare_targets(star_mod, name, depth + 1))
+        return out
+
+    def attr_targets(self, mod, root, attrs):
+        """Resolve `root.attrs...` where the base is statically known."""
+        out = []
+        for kind, payload in mod.bindings.get(root, ()):
+            if kind == "def":
+                node = mod.members(()).get(root)
+                if isinstance(node, ast.ClassDef):
+                    out.extend(self.chain_in_class(mod, (root,), attrs))
+            elif kind == "import":
+                dotted, symbol = payload
+                if symbol is None:
+                    out.extend(self.walk_from_module(dotted, attrs))
+                else:
+                    sub = self.module_for((dotted + "." + symbol) if dotted else symbol)
+                    if sub is not None:
+                        out.extend(self.walk_from_module(
+                            (dotted + "." + symbol) if dotted else symbol, attrs))
+                    else:
+                        source_mod = self.module_for(dotted)
+                        if source_mod is not None:
+                            node = _symbol_node(source_mod, (), symbol)
+                            if isinstance(node, ast.ClassDef) and attrs:
+                                out.extend(self.chain_in_class(
+                                    source_mod, (symbol,), attrs))
+                            elif not attrs:
+                                out.append((source_mod, (), symbol))
+        return out
+
+    # -- the fixpoint ------------------------------------------------------
+
+    def resolve(self, mod, qualpath, kind, payload, lineno, is_call, locals_):
+        """Targets for one reference, or [] for opaque, or raise for unbound."""
+        if kind == "attr":
+            root, attrs = payload
+            if root in ("self", "cls") and qualpath:
+                found = self.chain_in_class(mod, qualpath, attrs)
+                if found:
+                    return found
+                if is_call:
+                    # The receiver of a CALL that we cannot resolve. Code runs
+                    # behind it and would not be hashed, so a required part of the
+                    # key cannot be set: fatal, never skipped.
+                    chain = root + "." + ".".join(attrs)
+                    raise UnresolvedCallee(
+                        f"cannot resolve code identity for {self.region_label}: the "
+                        f"receiver '{chain}' at {mod.relpath}:{lineno} is not a "
+                        f"member of {'.'.join(qualpath)}, not inherited from an "
+                        f"in-project base, and not assigned in "
+                        f"{qualpath[-1]}.__init__ to an in-project class (only "
+                        f"`Name(...)`, a class attribute, or a module-qualified "
+                        f"in-project name can be followed). Code reached through it "
+                        f"would not be hashed, so this is fatal rather than hashed "
+                        f"as if the call were absent.")
+                return []                     # a VALUE read: opaque, skipped
+            if root in locals_:
+                return []                     # attribute on a local/unknown value
+            if root in _IMPLICIT_MODULE_NAMES:
+                return []
+            return self.attr_targets(mod, root, attrs)
+
+        name = payload
+        if name in locals_ or name in _IMPLICIT_MODULE_NAMES:
+            return []
+        import builtins
+
+        targets = self.bare_targets(mod, name)
+        if targets:
+            return targets
+        if hasattr(builtins, name):
+            return []                         # builtin: external by definition
+        raise UnresolvedCallee(
+            f"cannot resolve code identity for {self.region_label}: the name "
+            f"'{name}' at {mod.relpath}:{lineno} has no binding anywhere -- not "
+            f"local, not module-level in {mod.relpath}, not imported, and not a "
+            f"builtin. A required part of the key cannot be set, so this is fatal "
+            f"rather than hashed as if the call were absent.")
+
+    def run(self, start_mod, start_qp, start_name):
+        """Fixpoint over the inlined set. Returns {canonical entry: node}."""
+        queue = [(start_mod, start_qp, start_name)]
+        while queue:
+            mod, qualpath, name = queue.pop()
+            entry = (mod.relpath, qualpath, name)
+            if entry in self.seen:
+                continue
+            node = _symbol_node(mod, qualpath, name)
+            if node is None:
+                # Only reachable for a callee that resolved to a name with no
+                # node (an import alias of a module, say); treat as opaque.
+                continue
+            self.seen[entry] = node
+            if isinstance(node, ast.ClassDef):
+                # A class reached as an INSTANCE (`self.inner = Inner()` then
+                # `self.inner.forward(x)`) contributes its own body, and the body
+                # that actually runs may be INHERITED: Qwen3_5Model defines no
+                # `forward`; Qwen3NextModel does. Without this the model forward's
+                # digest covered the wrapper and an empty class, and an edit to the
+                # real transformer body did not invalidate it (demonstrated on a
+                # copy of qwen3_5.py + qwen3_next.py). In-project bases are entries
+                # in their own right; external bases (nn.Module) stay opaque.
+                for base_mod, base_qp in self.bases(mod, qualpath + (name,)):
+                    queue.append((base_mod, base_qp[:-1], base_qp[-1]))
+                continue
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue                      # an assignment: hashed whole
+            locals_ = _local_names(node)
+            for kind, payload, lineno, is_call in _refs(node):
+                for target_mod, target_qp, target_name in self.resolve(
+                        mod, qualpath, kind, payload, lineno, is_call, locals_):
+                    queue.append((target_mod, target_qp, target_name))
+        return self.seen
+
+
+def _canonical_name(qualpath, name):
+    """The hash key for one inlined entry: its QUALIFIED NAME, and nothing else.
+
+    NOT the file. A file rename does not change a lowered graph, so it must not
+    invalidate a recipe (PROTOCOL §8); the same argument rules out the absolute
+    path, which would also make the digest depend on where the checkout lives.
+    Two distinct functions that share a qualname still both contribute: they are
+    separate entries in the walk's seen-set, and their dumps are hashed in sorted
+    order, so the pair (name, dump) is a total order.
+    """
+    return ".".join(tuple(qualpath) + (name,))
 
 
 def code_identity(fn) -> str:
-    """hash(normalised AST of fn + every in-file function it transitively calls).
+    """hash(normalised AST of fn + every project function inlined into it).
 
     Normalised: docstrings stripped, no line numbers, no attributes, fields
     unannotated. Two files differing only in comments or whitespace produce the
     same digest, which is the PROTOCOL §8 requirement.
 
-    A function whose source cannot be resolved raises `UnnamedCompile` rather than
-    returning a placeholder: a placeholder would keep working while keyed on
-    something we cannot see, and nobody would know which compiles were doing it.
+    The inlined set is canonical: entries are keyed on the project-relative path
+    and the qualified name, and hashed in sorted order, so the digest does not
+    depend on which file the walk started from, on walk order, or on where the
+    checkout lives.
+
+    A function whose source cannot be resolved raises `UnnamedCompile`; a callee
+    with no binding anywhere raises `UnresolvedCallee`. A callee whose source is
+    outside `_PROJECT_ROOTS` is skipped -- library code is identified by version,
+    not by source -- so nothing here ever reads torch or the stdlib.
     """
     import ast
     import hashlib
-
-    # MEMOISED PER FUNCTION OBJECT. `_PARSE_CACHE` already stops a repeat
-    # `ast.parse`, but the closure walk, the docstring strip and the dump still
-    # ran on every call (~284 us measured). The cache sits ABOVE the parse cache
-    # and does not change `parse_count()`'s meaning: a real parse still counts,
-    # and it is skipped only when the whole digest is already known.
-    hit = _IDENTITY_CACHE.get(id(fn))
-    if hit is not None and hit[0] is fn:
-        return hit[1]
 
     path = getattr(getattr(fn, "__code__", None), "co_filename", None)
     qualname = getattr(fn, "__qualname__", getattr(fn, "__name__", None))
@@ -439,29 +1185,42 @@ def code_identity(fn) -> str:
             f"under any of {_PROJECT_ROOTS}, so its source is not part of the key. "
             f"Regions must wrap project code; library code is identified by version.")
 
-    # Methods appear as "Class.method"; the closure walk works on module-level names.
-    name = qualname.split(".")[-1]
-    entries = _closure(path, name)
-    if not entries:
+    parts = qualname.split(".")
+    if "<locals>" in parts:
+        raise UnnamedCompile(
+            f"cannot resolve code identity for {qualname} at {path}: the function is "
+            f"defined in a local scope, so its source cannot be addressed by "
+            f"qualified name. Regions must wrap a module-level function or a method.")
+    name = parts[-1]
+    qualpath = tuple(parts[:-1])
+
+    walk = _Walk(region_label=f"{qualname} at {path}")
+    mod = walk.module(path)
+    if mod is None:
+        raise UnnamedCompile(
+            f"cannot resolve code identity for {qualname} at {path}: the file could "
+            f"not be read or parsed, so its source cannot be part of the key.")
+    if _symbol_node(mod, qualpath, name) is None:
         raise UnnamedCompile(
             f"cannot resolve code identity for {qualname} at {path}: no function or "
-            f"method named {name!r} was found in that module.")
+            f"method named {name!r} is defined in "
+            f"{'.'.join(qualpath) or 'that module'}. (An inherited method carries "
+            f"the DEFINING class in __qualname__, so this means the name is wrong.)")
+
+    entries = walk.run(mod, qualpath, name)
 
     h = hashlib.blake2b(digest_size=16)
-    for entry_name, node in entries:
+    rows = []
+    for (_relpath, qp, entry_name), node in entries.items():
         normalised = _strip_docstrings(node)
-        h.update(entry_name.encode("utf-8"))
+        dump = ast.dump(normalised, annotate_fields=False, include_attributes=False)
+        rows.append((_canonical_name(qp, entry_name), dump))
+    for canonical, dump in sorted(rows):
+        h.update(canonical.encode("utf-8"))
         h.update(b"\0")
-        h.update(ast.dump(normalised, annotate_fields=False,
-                          include_attributes=False).encode("utf-8"))
+        h.update(dump.encode("utf-8"))
         h.update(b"\0")
-    digest = h.hexdigest()
-    # ONLY SUCCESS IS CACHED. Every refusal above raised, so an unresolvable
-    # function leaves no entry: caching the failure would poison a later
-    # legitimate call for the same object, and the `UnnamedCompile` contract is
-    # that the refusal keeps firing.
-    _IDENTITY_CACHE[id(fn)] = (fn, digest)
-    return digest
+    return h.hexdigest()
 
 
 # Region name -> code identity, registered where the function object exists (the
@@ -596,6 +1355,16 @@ class UnnamedCompile(RuntimeError):
     keyed on something explicitly ruled out, and nobody would know which compiles
     were doing it. Raising also gives the true population of compiled regions on
     the first boot, which closes the "how many are there really" gap.
+    """
+
+
+class UnresolvedCallee(UnnamedCompile):
+    """A callee with no binding anywhere. A required part of the key is unset.
+
+    Raised rather than skipped: hashing a function as if the call were absent
+    produces a digest that claims to describe a graph it never looked at. The
+    message names the region, the unresolved name, and the file:line of the call
+    site, because the only useful response is to fix the call.
     """
 
 
