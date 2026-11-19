@@ -426,14 +426,26 @@ void DiskCache::flush() {
 std::shared_ptr<RecipeHolder> DiskCache::Find(
     const std::string& compile_key,
     const std::string& graph_name) {
-  // THE SAME KEY THE STORE USED. It arrives as an argument from the request
-  // site; it is NOT derived here. Deriving it from `spec.hashCode()` is what
-  // made every lookup ask for a name no store had ever written.
-  if (compile_key.empty()) {
-    // No identity for this graph: there is nothing to look up. A miss, not a
-    // failure -- the store side is where an unnamed compile is fatal.
-    return nullptr;
-  }
+  // AN EMPTY KEY IS NOT A MISS -- IT IS AN UNNAMED COMPILE.
+  //
+  // This used to `return nullptr`, on the reasoning that the store side is where
+  // an unnamed compile is fatal. That reasoning does not hold: it is the SAME
+  // graph. If it has no identity the store raises anyway, so tolerating it here
+  // only moves the failure one step later -- and if the store is skipped for any
+  // reason, nothing surfaces at all and the graph recompiles on every boot
+  // forever, silently. That is the worst combination: a policy that says unnamed
+  // compiles are fatal, plus a path that quietly tolerates them.
+  //
+  // There is no valid state in which a graph reaches the recipe path with no
+  // identity, so crash and name it. That is also the better instrument: instead
+  // of counting empty keys and inferring, the first boot stops at one and names
+  // the graph.
+  TORCH_CHECK(!compile_key.empty(),
+              "recipe cache key: the lookup for graph '", graph_name,
+              "' has an EMPTY compile key. Every compiled graph must have an "
+              "identity, so this is the same unnamed compile the store side "
+              "refuses. Tolerating it here would recompile this graph on every "
+              "boot and never cache it.");
   std::stringstream ss;
   auto recipe = recipe_cache_.lookup(compile_key + cache_id_suffix_, ss);
   // HIT or MISS, and WHICH GRAPH ASKED. The key alone cannot show a collision:

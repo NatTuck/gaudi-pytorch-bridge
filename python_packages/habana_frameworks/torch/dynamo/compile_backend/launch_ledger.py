@@ -149,6 +149,48 @@ def declared_identity():
     return st[-1] if st else None
 
 
+# ---------------------------------------------------------------------------
+# Bundle collection: region key -> the ordered frame keys one trace produced
+# ---------------------------------------------------------------------------
+#
+# A region-granularity key names a BUNDLE of frame artifacts, because one
+# `torch.compile` target yields one FX frame per inner function dynamo compiles.
+# The consult cannot know how many frames there are without tracing, so the count
+# and the order are recorded HERE, at the only place that sees both the region
+# key (through the declared identity) and each frame's own key.
+#
+# Keyed per thread, like the declared identity, because a region call and the
+# frames it produces all happen on one thread.
+_bundles = threading.local()
+
+
+def _bundle_map() -> dict:
+    m = getattr(_bundles, "map", None)
+    if m is None:
+        m = _bundles.map = {}
+    return m
+
+
+def bundle_append(region_key: str, frame_key: str) -> None:
+    """Record one frame key under the region key being traced."""
+    if not region_key:
+        return
+    _bundle_map().setdefault(region_key, []).append(frame_key)
+
+
+def take_bundle(region_key: str) -> list:
+    """Pop the frame keys recorded for `region_key` on this thread.
+
+    Popping rather than reading is deliberate: a second trace of the same region
+    in the same process must build its own bundle from its own frames, and a
+    stale read would silently mix the two.
+    """
+    if not region_key:
+        return []
+    return _bundle_map().pop(region_key, [])
+
+
+
 def _declared_shape(ri, gm, declared):
     """A RecipeShape for a region that names itself.
 
@@ -373,6 +415,11 @@ def record_partition(graph_name: str, gm) -> "Handle | None":
 
         _key = _ci.frame_record(name, ident[0], gm).key()
         note_region(graph_name, name, source, idx, _key)
+        # Record this frame under the region key the caller declared, so the
+        # bundle can be written when the region call finishes. The region key is
+        # the PRE-TRACE key; the frame key is this frame's own. Both are needed:
+        # the consult looks up the former and loads the latter.
+        bundle_append(declared_compile_key(), _key)
     return Handle(graph_name, index)
 
 

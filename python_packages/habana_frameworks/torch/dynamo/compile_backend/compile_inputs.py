@@ -610,6 +610,13 @@ def _signature_of(value, where: str):
         return [("float", repr(value))]
     if isinstance(value, str):
         return [("str", value)]
+    # SYMBOLIC SCALARS. The model forward runs with backed dynamic shapes, so its
+    # placeholders carry `SymInt` rather than `int`. A SymInt genuinely selects a
+    # graph -- it is a dimension -- so it must be keyed, in a canonical form.
+    # `str()` is used rather than forcing `int()`, which would specialise the
+    # symbol and defeat the dynamic-shape machinery.
+    if type(value).__name__ in ("SymInt", "SymFloat", "SymBool"):
+        return [(type(value).__name__.lower(), str(value))]
     if value is None:
         # `None` IS A VALUE dynamo guards on. Recorded explicitly so it stays
         # distinguishable from an argument that is absent entirely.
@@ -766,15 +773,27 @@ def frame_record(name: str, identity: str, gm) -> CompileInputs:
     for node in gm.graph.nodes:
         if node.op != "placeholder":
             continue
+        # THREE NAMES FOR THE SAME FACT. `example_value` is the modern one; older
+        # graphs carry `val` or `tensor_meta`. Reading only the first made every
+        # weight-loading placeholder fall through to the weak form below, where
+        # two frames that both take a tensor called `weight` -- shapes 16384 and
+        # 5120 -- produced the SAME key and collided exactly as before.
         value = node.meta.get("example_value")
         if value is None:
-            # The frame's input has no example value, so its shape cannot be
-            # read. Recording the fact is weaker than recording the shape, but
-            # it is not a silent omission: two frames differing only here still
-            # get different keys if their placeholder sets differ.
-            shapes.append(("placeholder-without-value", node.name))
-        else:
-            shapes.extend(_signature_of(value, node.name))
+            value = node.meta.get("val")
+        if value is None:
+            value = node.meta.get("tensor_meta")
+        if value is None:
+            # NO SHAPE, NO KEY. Recording the placeholder's *name* instead is
+            # what turned a missing shape into a silent collision; a weak key is
+            # indistinguishable from a good one at the cache. Fail here, where
+            # the frame can be named, rather than at a launch with an arity
+            # mismatch that points nowhere.
+            raise RuntimeError(
+                f"recipe cache key: frame '{name}' ({identity}) has a placeholder "
+                f"'{node.name}' with no example_value, val or tensor_meta, so its "
+                f"shape cannot be read. Refusing to build a key that omits it.")
+        shapes.extend(_signature_of(value, node.name))
     return build(
         instance=(),
         region=(("name", name), ("code", identity)),

@@ -18,6 +18,26 @@ import habana_frameworks.torch.internal.bridge_config as bc
 
 from . import backends
 
+# TRACE GATE (docs/PROTOCOL.md 13): no tracing without a cache consult.
+#
+# Installed here because this package must be imported for the HPU dynamo backend
+# to exist at all, so it precedes every compile that uses it. The gate raises
+# BaseException (not Exception) so dynamo cannot swallow it into a silent eager
+# fallback.
+#
+# The log line is not decoration: it is the only way to tell "the gate is armed"
+# from "the gate never loaded", and believing you have enforcement when you do
+# not is worse than having none (PROTOCOL 11).
+from .trace_gate import TraceGate as _TraceGate
+
+_TraceGate.install()
+
+import logging as _logging
+
+_logging.getLogger(__name__).info(
+    "trace gate: installed=%s -- no trace without a cache consult (PROTOCOL 13)",
+    _TraceGate.installed())
+
 if bc.get_pt_hpu_enable_compiled_autograd():
     from .experimental import enable_compiled_autograd
 
