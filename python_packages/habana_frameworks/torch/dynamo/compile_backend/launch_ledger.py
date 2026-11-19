@@ -200,7 +200,8 @@ def _declared_shape(ri, gm, declared):
     the shape is as stable as the function's own source, which is exactly what
     the numbering needs.
     """
-    name, file, line = declared
+    # Four fields in the declared entry; the fourth is the region key.
+    name, file, line = declared[:3]
     f = file or "<declared>"
     ln = int(line) if line and line > 0 else 0
     func = name.rsplit(":", 1)[-1]
@@ -471,7 +472,13 @@ def _seal(reg: _Region) -> None:
     # trace still fails exactly as before. See `set_declared_identity`.
     declared = declared_identity()
     if not sites and declared:
-        dname, dfile, dline = declared
+        # The declared entry is `(name, file, line, compile_key)` -- FOUR fields,
+        # pushed by `set_declared_identity`. Only the first three are the source
+        # identity; the fourth is the pre-trace region key, read by
+        # `declared_compile_key`. Unpacking all four into three names raised
+        # `ValueError: too many values to unpack`, which `device_regions.py`
+        # caught and turned into a silent eager fallback for the region.
+        dname, dfile, dline = declared[:3]
         # The name is the declaration; the source annotation is the wrapped
         # function's own definition site, which is where a hand-written region
         # really lives -- its FX nodes carry no trace because the ops are minted

@@ -71,18 +71,33 @@ that installs the gate.
 
 Implementation note on where the gate fires
 -------------------------------------------
-``torch._dynamo.convert_frame.convert_frame_assert`` is the function named as
-the choke point, and :meth:`TraceGate.install` wraps exactly that function, as
-specified.  Be aware of its real shape: ``convert_frame_assert`` is a *factory*
-that constructs and returns a ``ConvertFrameAssert`` instance, whose
-``__call__`` performs the actual per-frame conversion.  So the gate fires at
-each construction of the frame converter rather than once per converted frame.
-Because the converter is constructed before any frame in its region can be
-converted, tracing still cannot begin without a permit -- the gate is real --
-but ``frames_traced`` counts gated converter constructions, which is one per
-region plus any rebuilds, not one per traced frame.  If per-frame granularity
-is wanted, the same ``assert_permitted`` call must additionally be wrapped
-around ``ConvertFrameAssert.__call__``.
+``torch._dynamo.convert_frame.convert_frame_assert`` is *not* the per-frame
+entry point, despite the name: it is a **factory** that constructs and returns a
+``ConvertFrameAssert`` instance (``convert_frame.py:811``).  That instance's
+``__call__`` (``convert_frame.py:631``) is what actually converts a frame, and
+it is reached from both dispatch paths:
+
+* default (``fullgraph=False``): ``CatchErrorsWrapper.__call__``
+  (``convert_frame.py:2522``) -> ``ConvertFrame.__call__``
+  (``convert_frame.py:2308``) -> ``self._inner_convert(...)``
+  (``convert_frame.py:2323``), where ``_inner_convert`` is the instance built
+  once at ``convert_frame.py:2290``;
+* ``fullgraph=True``: ``eval_frame.py:2699`` builds the same
+  ``ConvertFrameAssert``, and the callback invokes its ``__call__`` directly.
+
+So the gate is installed on ``ConvertFrameAssert.__call__``, which is the one
+function every frame conversion passes through on both paths, and it therefore
+fires **once per frame conversion** -- including a recompile, because a
+guard-failure recompile re-enters that same cached instance's ``__call__``
+rather than reconstructing it.
+
+The factory is deliberately left unpatched.  It traces nothing (measured: at the
+end of ``import torch`` the gate is armed and
+``torch._dynamo.utils.counters["frames"]["total"]`` is still 0), so gating it
+would refuse a construction that cannot trace; and making that survivable would
+require the *caller* to mint a permit on its own behalf, with no cache key,
+which is exactly the "empty key" and "caller mints" conditions the protocol
+forbids.  One choke point, at the place where frames are actually converted.
 """
 
 from __future__ import annotations
@@ -97,8 +112,11 @@ __all__ = ["TraceWithoutCacheConsult", "TraceGate"]
 #: Module that owns the frame-conversion choke point.
 _TARGET_MODULE: Final[str] = "torch._dynamo.convert_frame"
 
-#: Attribute inside that module which is wrapped by :meth:`TraceGate.install`.
-_TARGET_ATTR: Final[str] = "convert_frame_assert"
+#: Class inside that module whose ``__call__`` performs one frame conversion.
+_TARGET_CLASS: Final[str] = "ConvertFrameAssert"
+
+#: The per-frame method on that class, wrapped by :meth:`TraceGate.install`.
+_TARGET_METHOD: Final[str] = "__call__"
 
 #: Marker set on our wrapper so ``install()`` can recognise its own work and
 #: so ``installed()`` can answer without guessing.
@@ -220,12 +238,14 @@ def _looks_like_frame(obj: Any) -> bool:
 def _locate_frame(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
     """Describe the frame being converted, from a call's arguments.
 
-    ``convert_frame_assert`` does not take a frame directly -- it takes a
-    ``compiler_fn`` and returns a converter -- so in the common case there is no
-    frame to name here.  We still scan the arguments (and the ``frame`` keyword,
-    which other frame-conversion entry points use) because the caller may be
-    wrapping a different, frame-taking choke point, and a real
-    ``file:line`` in the crash message is far more useful than "unknown".
+    ``ConvertFrameAssert.__call__(self, frame, cache_entry, hooks, frame_state,
+    *, skip=0)`` takes the frame as its second positional argument, so the
+    normal case finds it and the crash message names a real ``file:line``.  The
+    scan is over all arguments rather than a fixed index so that the gate stays
+    correct if the position ever moves, and so a ``frame`` passed by keyword is
+    still found.  A ``file:line`` in the crash message is worth much more than
+    "unknown", so when no frame is found the message says exactly that instead
+    of guessing.
     """
     candidates: list[Any] = list(args) + list(kwargs.values())
     for candidate in candidates:
@@ -236,8 +256,9 @@ def _locate_frame(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
                 f"({code.co_filename}:{candidate.f_lineno})"
             )
     return (
-        "an unnamed frame (no frame argument is visible in the call to "
-        "convert_frame_assert; it takes a compiler_fn and returns a converter)"
+        "an unnamed frame (no frame object was visible in the arguments to "
+        "ConvertFrameAssert.__call__; the first positional argument is the "
+        "converter, the second is the frame)"
     )
 
 
@@ -368,11 +389,18 @@ class TraceGate:
 
     @staticmethod
     def install() -> None:
-        """Patch ``convert_frame.convert_frame_assert`` to enforce the gate.
+        """Patch ``ConvertFrameAssert.__call__`` to enforce the gate.
 
         The wrapper calls :meth:`assert_permitted` first, before the original
-        body runs, so no frame converter can be constructed -- and therefore no
-        frame can be traced -- without a permit.
+        body runs, so no frame can be converted without a permit.  This is the
+        single per-frame entry point for both the default and the ``fullgraph``
+        dispatch paths, and a guard-failure recompile re-enters it, so every
+        trace -- first or repeated -- passes through the gate exactly once.
+
+        The ``convert_frame_assert`` factory is deliberately NOT patched: it
+        constructs the converter and converts nothing, and gating it would force
+        callers to mint a keyless permit for a construction, which the protocol
+        forbids.  See the module docstring.
 
         Idempotent: calling it twice patches once.  The wrapper is marked with
         :data:`_WRAPPER_MARK`, so even a re-imported copy of this module (which
@@ -383,11 +411,12 @@ class TraceGate:
             if TraceGate.installed():
                 return
             module = importlib.import_module(_TARGET_MODULE)
-            original = getattr(module, _TARGET_ATTR)
+            owner = getattr(module, _TARGET_CLASS)
+            original = getattr(owner, _TARGET_METHOD)
             if getattr(original, _WRAPPER_MARK, False):
                 # Patched by another copy of this module; do not double-wrap.
                 return
-            setattr(module, _TARGET_ATTR, _make_wrapper(original))
+            setattr(owner, _TARGET_METHOD, _make_wrapper(original))
 
     @staticmethod
     def installed() -> bool:
@@ -400,12 +429,15 @@ class TraceGate:
             module = importlib.import_module(_TARGET_MODULE)
         except Exception:
             return False
-        target = getattr(module, _TARGET_ATTR, None)
+        owner = getattr(module, _TARGET_CLASS, None)
+        if owner is None:
+            return False
+        target = getattr(owner, _TARGET_METHOD, None)
         return bool(getattr(target, _WRAPPER_MARK, False))
 
 
 def _make_wrapper(original: Any) -> Any:
-    """Build the gate-enforcing replacement for ``convert_frame_assert``.
+    """Build the gate-enforcing replacement for ``ConvertFrameAssert.__call__``.
 
     ``functools.wraps`` preserves ``__name__``, ``__qualname__``, ``__doc__``,
     ``__module__`` and ``__dict__`` so the wrapper is indistinguishable from the
@@ -414,6 +446,12 @@ def _make_wrapper(original: Any) -> Any:
     arguments sees identical behaviour.  The markers are set *after*
     ``functools.wraps`` so that copying the original's ``__dict__`` cannot
     clobber them.
+
+    Patching the *class* attribute rather than an instance is what makes the
+    gate cover every converter, including the one ``ConvertFrame`` builds for
+    itself at ``convert_frame.py:2290`` and the one ``fullgraph`` builds at
+    ``eval_frame.py:2699``.  Python looks special methods up on the type, so a
+    class-level ``__call__`` is the only place that catches all of them.
     """
 
     @functools.wraps(original)

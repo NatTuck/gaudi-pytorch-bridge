@@ -246,10 +246,33 @@ def parse_count() -> int:
 
 
 def reset_parse_cache() -> None:
-    """Test seam: drop the parse cache and the counter."""
+    """Test seam: drop the parse cache and the counter.
+
+    This does NOT drop `_IDENTITY_CACHE`: a memoised digest is a complete answer
+    for that function OBJECT, so it is not a parse-cache entry. A test that needs
+    the walk to run again for the same object calls `reset_identity_cache()`.
+    """
     global _PARSE_COUNT
     _PARSE_CACHE.clear()
     _PARSE_COUNT = 0
+
+
+# id(fn) -> (fn, digest). Keyed on the FUNCTION OBJECT's identity and holding a
+# STRONG reference to it, so a recycled `id` cannot produce a stale hit -- the
+# same discipline as `_LOCATION_CACHE`. The walk below costs ~284 us/call and the
+# consult runs once per region call (~12,000 per boot), so an unregistered
+# `torch.compile` target would otherwise pay it on every single call.
+#
+# NOTHING MUTABLE IS IN THE KEY. `code_identity` is a pure function of the
+# function object (its `__code__.co_filename` and its in-file closure), and the
+# file is re-read only through the parse cache, which is mtime-keyed. A function
+# object cannot change its source, so the memo cannot go stale for a live `fn`.
+_IDENTITY_CACHE: dict[int, tuple] = {}
+
+
+def reset_identity_cache() -> None:
+    """Test seam: drop the code-identity memo."""
+    _IDENTITY_CACHE.clear()
 
 
 def _in_project(path: str) -> bool:
@@ -393,6 +416,15 @@ def code_identity(fn) -> str:
     import ast
     import hashlib
 
+    # MEMOISED PER FUNCTION OBJECT. `_PARSE_CACHE` already stops a repeat
+    # `ast.parse`, but the closure walk, the docstring strip and the dump still
+    # ran on every call (~284 us measured). The cache sits ABOVE the parse cache
+    # and does not change `parse_count()`'s meaning: a real parse still counts,
+    # and it is skipped only when the whole digest is already known.
+    hit = _IDENTITY_CACHE.get(id(fn))
+    if hit is not None and hit[0] is fn:
+        return hit[1]
+
     path = getattr(getattr(fn, "__code__", None), "co_filename", None)
     qualname = getattr(fn, "__qualname__", getattr(fn, "__name__", None))
     if not path or not qualname:
@@ -423,7 +455,13 @@ def code_identity(fn) -> str:
         h.update(ast.dump(normalised, annotate_fields=False,
                           include_attributes=False).encode("utf-8"))
         h.update(b"\0")
-    return h.hexdigest()
+    digest = h.hexdigest()
+    # ONLY SUCCESS IS CACHED. Every refusal above raised, so an unresolvable
+    # function leaves no entry: caching the failure would poison a later
+    # legitimate call for the same object, and the `UnnamedCompile` contract is
+    # that the refusal keeps firing.
+    _IDENTITY_CACHE[id(fn)] = (fn, digest)
+    return digest
 
 
 # Region name -> code identity, registered where the function object exists (the
@@ -733,12 +771,28 @@ def make_record(fn, args, kwargs, module) -> CompileInputs:
         shapes.extend(_signature_of(a, f"args[{i}]"))
     for k in sorted(kwargs, key=repr):
         shapes.extend(_signature_of(kwargs[k], f"kwargs[{k!r}]"))
-    name = getattr(fn, "__qualname__", repr(fn))
-    # SAME ACCESSOR AS `key_for_region`: the registry, populated by
-    # `register_region_code`. One way to obtain the code identity, so the store
-    # path and the warm path cannot diverge on it.
+    # THE REGISTRY IS KEYED BY "module:qualname". `Region.__init__` registers
+    # under `f"{fn.__module__}:{fn.__qualname__}"`, so looking the registry up
+    # under the BARE `__qualname__` never hit: every consult fell through to the
+    # source walk (~284 us) and the registry was dead code. Look up the SAME form
+    # the registrar used first, then the bare qualname (a caller may have
+    # registered under it), and only then compute the identity.
+    #
+    # CONSEQUENCE, DELIBERATE: for a REGISTERED region the `region` field becomes
+    # ("name", "module:qualname") instead of ("name", __qualname__), so every key
+    # for those regions changes. That is acceptable only because the recipe cache
+    # has not yet been populated under this scheme; it must land before the first
+    # populate boot. Unregistered targets keep the old bare-qualname value.
+    qualname = getattr(fn, "__qualname__", repr(fn))
+    fn_module = getattr(fn, "__module__", None)
+    name = f"{fn_module}:{qualname}" if fn_module else qualname
     code = region_code(name)
     if code == "unknown":
+        name = qualname
+        code = region_code(name)
+    if code == "unknown":
+        # LEGITIMATE: arbitrary `torch.compile` targets are not Regions and are
+        # never registered, so the source walk is the only way to identify them.
         code = code_identity(fn)
     return build(
         instance=_instance_attributes(module),

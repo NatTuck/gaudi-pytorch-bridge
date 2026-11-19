@@ -38,6 +38,37 @@ _logging.getLogger(__name__).info(
     "trace gate: installed=%s -- no trace without a cache consult (PROTOCOL 13)",
     _TraceGate.installed())
 
+# COMPILE GATE (docs/PROTOCOL.md 13): the consult moves to `torch.compile` itself.
+#
+# The trace gate above refuses a trace with no consult, but the consult lived in
+# the callers we own (`Region`, the model-forward call site). Upstream vllm-core
+# calls `torch.compile` at module scope in places we do not own -- e.g.
+# `vllm-core/vllm/utils/deep_gemm.py:708`, reached from
+# `vllm-core/vllm/v1/attention/backends/mla/indexer.py:21` -- and those traced
+# with no consult, so the gate killed the boot. Patching `torch.compile` puts the
+# consult at the one point EVERY compiled callable passes through: the object it
+# returns consults first, and on a hit Dynamo is never entered.
+#
+# ORDERING: `install()` needs `torch.compile` to already exist, and it does.
+# `compile_backend` is imported from `core/__init__.py:141` (non-lazy mode),
+# which runs inside torch's device-backend autoload at
+# `torch/__init__.py:3077` -- long after `def compile` at
+# `torch/__init__.py:2609`. `install()` raises rather than silently doing
+# nothing if that ever stops being true.
+#
+# The log line is load-bearing: `installed=%s` is how a boot log proves the
+# wrapper is actually in place. A gate that did not load is indistinguishable
+# from one that never fires, and believing you have enforcement when you do not
+# is worse than having none (PROTOCOL 11).
+from . import compile_gate as _compile_gate
+
+_compile_gate.install()
+
+_logging.getLogger(__name__).info(
+    "compile gate: installed=%s -- torch.compile consults before it traces "
+    "(PROTOCOL 13)",
+    _compile_gate.installed())
+
 if bc.get_pt_hpu_enable_compiled_autograd():
     from .experimental import enable_compiled_autograd
 
