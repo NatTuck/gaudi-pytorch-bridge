@@ -91,7 +91,18 @@ logger = logging.getLogger(__name__)
 # Set explicitly rather than via the parent, so it survives any later change to
 # the `habana_frameworks` level. `logger.setLevel` on a child overrides the
 # inherited level without touching the parent or any sibling.
+#
+# THE FIX IS A HANDLER, NOT A LEVEL. `logger.setLevel(INFO)` alone was tried and
+# did nothing, because a record that passes this logger's own level still has to
+# pass an ANCESTOR's handler, and the `habana_frameworks` handler is above INFO.
+# So this logger gets its own StreamHandler (stderr, which launch-dflash.sh
+# redirects into the boot log) and stops propagating, so nothing is emitted twice.
+_diag_handler = logging.StreamHandler()
+_diag_handler.setLevel(logging.INFO)
+_diag_handler.setFormatter(logging.Formatter("[recipe-consult] %(message)s"))
+logger.addHandler(_diag_handler)
 logger.setLevel(logging.INFO)
+logger.propagate = False
 
 #: Returned by `consult` when the caller must trace. The permit has already been
 #: minted, so the trace is legal.
@@ -973,7 +984,7 @@ class _MetaReader:
 
 
 def read_recipe_inputs(path: str) -> tuple:
-    """`(num_inputs, [shape, ...])` from a recipe `.metadata` file.
+    """`(num_inputs, num_outputs, [shape, ...])` from a recipe `.metadata` file.
 
     Raises on anything it does not understand. The caller turns that into a
     refusal rather than a guess: a format this reader cannot follow is a reason
@@ -1011,7 +1022,16 @@ def read_recipe_inputs(path: str) -> tuple:
     reader.u64()                         # id
     reader.u64()                         # iter_idx
     num_inputs = reader.u64()
-    return num_inputs, shapes
+    # THE HEADER CONTINUES, and num_outputs is what says whether the launch
+    # returns anything. Field order is RecipeArgumentSpec's, verified against the
+    # serializer: id, iter_idx, num_inputs, num_induplicates, num_dma_inputs,
+    # num_shape_tensors, num_intermediates, num_outputs, ...
+    reader.u64()                         # num_induplicates
+    reader.u64()                         # num_dma_inputs
+    reader.u64()                         # num_shape_tensors
+    reader.u64()                         # num_intermediates
+    num_outputs = reader.u64()
+    return num_inputs, num_outputs, shapes
 
 
 def _recipe_inputs(cache_dir: str, frame_key: str) -> tuple:
@@ -1026,6 +1046,30 @@ def _recipe_inputs(cache_dir: str, frame_key: str) -> tuple:
         _METADATA_CACHE.clear()
     _METADATA_CACHE[cache_key] = parsed
     return parsed
+
+
+def _in_place_result(cache_dir: str, frame_key: str, inputs: tuple):
+    """The tensor an IN-PLACE region returns, or None.
+
+    A recipe with `num_outputs == 0` is an in-place op: the graph writes into its
+    argument and produces no new tensor, so `graph_launch` hands back an empty
+    stack. The eager function still returns the mutated tensor and callers write
+    `t = _zero_attention_kv(t)`, so returning the empty stack makes `t` None.
+
+    CONSERVATIVE ON PURPOSE: only when the recipe has no outputs AND the call has
+    exactly ONE tensor slot, which is then unambiguously the in-place target. With
+    two or more slots there is no way to know which one the region returns, and
+    returning the wrong one would be silent corruption instead of a loud failure,
+    so it returns None and the caller keeps the launch's own result.
+    """
+    try:
+        _n_in, num_outputs, _shapes = _recipe_inputs(cache_dir, frame_key)
+    except Exception:  # noqa: BLE001 - unreadable metadata: keep the launch result
+        return None
+    if num_outputs != 0:
+        return None
+    slots = _call_tensor_slots(inputs)
+    return slots[0] if len(slots) == 1 else None
 
 
 def _is_tensor_like(value) -> bool:
@@ -1067,7 +1111,7 @@ def _preload_refusal(cache_dir: str, frame_key: str, inputs: tuple):
     backstop.
     """
     try:
-        num_inputs, shapes = _recipe_inputs(cache_dir, frame_key)
+        num_inputs, _num_outputs, shapes = _recipe_inputs(cache_dir, frame_key)
     except Exception as exc:  # noqa: BLE001 - unreadable is a reason to refuse
         return (f"its metadata could not be read ({type(exc).__name__}: {exc}), "
                 f"so the input binding cannot be validated before loading")
@@ -1330,7 +1374,6 @@ def consult(*, fn, args: tuple, kwargs: dict, module, region_name: str):
     if _CAPTURE_PATH is not None:
         _capture_call(region_name, args, kwargs)
 
-
     # AN EMPTY KEY MUST BE IMPOSSIBLE BY CONSTRUCTION, NOT MERELY UNLIKELY.
     # `make_record` requires every field and hashes them, so this can only fire
     # if a future change lets one default away -- which is exactly the silent
@@ -1591,6 +1634,16 @@ def consult(*, fn, args: tuple, kwargs: dict, module, region_name: str):
     logger.info("region consult: region=%s key=%s -> HIT (frame %s, recipe %d); "
                 "no trace", region_name, key, frame_key, recipe_id)
     STATS["hit"] += 1
+    # AN IN-PLACE REGION HAS NO RECIPE OUTPUTS, so the launch returns an empty
+    # stack while the eager function returns the tensor it mutated. Callers write
+    # `t = _zero_attention_kv(t)`, so handing back the empty stack made `t` None
+    # and the next `.view()` failed -- that was the KV-cache crash, and the log
+    # shows it: `_zero_attention_kv -> HIT`, then
+    # `AttributeError: 'NoneType' object has no attribute 'view'` in
+    # `_attention_kv_tensors`.
+    _in_place = _in_place_result(cache_dir, frame_key, inputs)
+    if _in_place is not None and not _result:
+        _result = _in_place
     return key, _result
 
 
